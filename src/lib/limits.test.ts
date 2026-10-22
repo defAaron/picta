@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest"
-import { openLimits, releaseScene, remainingWindow, takeWindow } from "./limits"
+import {
+  beginInflight,
+  clearInflight,
+  completeInflight,
+  expireInflight,
+  openLimits,
+  readInflight,
+  releaseScene,
+  remainingWindow,
+  takeWindow,
+} from "./limits"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const NOW = 1_700_000_000_000
@@ -83,6 +93,143 @@ describe("limits", () => {
     releaseScene(db, "absent", "absent")
     expect(remainingWindow(db, "sid:absent:scene", NOW, DAY_MS, 8).remaining).toBe(8)
     expect(remainingWindow(db, "ip:absent:scene", NOW, DAY_MS, 20).remaining).toBe(20)
+
+    db.close()
+  })
+})
+
+const FIVE_MINUTES_MS = 5 * 60 * 1000
+const SID = "sid-illustrate"
+const KEY = "4b6d8e2a-1c0f-4a7b-9d3e-5f6a7b8c9d0e"
+
+describe("inflight", () => {
+  it("begin then read shows a null projectId", () => {
+    const db = openLimits(":memory:")
+
+    expect(readInflight(db, SID)).toBeNull()
+    expect(beginInflight(db, SID, KEY, NOW)).toEqual({ ok: true })
+
+    expect(readInflight(db, SID)).toEqual({
+      sid: SID,
+      idempotencyKey: KEY,
+      projectId: null,
+      moment: null,
+      imagePrompt: null,
+      creditsCharged: null,
+      startedAt: NOW,
+    })
+
+    db.close()
+  })
+
+  it("second begin with the same key returns in_progress", () => {
+    const db = openLimits(":memory:")
+    expect(beginInflight(db, SID, KEY, NOW)).toEqual({ ok: true })
+    const before = readInflight(db, SID)
+
+    expect(beginInflight(db, SID, KEY, NOW + 1)).toEqual({ ok: false, reason: "in_progress" })
+    expect(readInflight(db, SID)).toEqual(before)
+
+    db.close()
+  })
+
+  it("replays the same key after complete without changing the project id", () => {
+    const db = openLimits(":memory:")
+    expect(beginInflight(db, SID, KEY, NOW)).toEqual({ ok: true })
+    completeInflight(db, SID, {
+      projectId: "proj-lantern",
+      moment: "The landing",
+      imagePrompt: "A lantern in a stairwell.",
+      creditsCharged: 5,
+    })
+    const before = readInflight(db, SID)
+
+    expect(beginInflight(db, SID, KEY, NOW + 40)).toEqual({ ok: true })
+    expect(readInflight(db, SID)).toEqual(before)
+    expect(readInflight(db, SID)?.projectId).toBe("proj-lantern")
+
+    db.close()
+  })
+
+  it("a different key returns busy", () => {
+    const db = openLimits(":memory:")
+    expect(beginInflight(db, SID, KEY, NOW)).toEqual({ ok: true })
+    const before = readInflight(db, SID)
+
+    expect(beginInflight(db, SID, "other-key", NOW + 5)).toEqual({ ok: false, reason: "busy" })
+    expect(readInflight(db, SID)).toEqual(before)
+
+    db.close()
+  })
+
+  it("expires a row older than 5 minutes and keeps one at exactly 5 minutes", () => {
+    const db = openLimits(":memory:")
+    expect(beginInflight(db, "stale", "key-stale", NOW - FIVE_MINUTES_MS - 1)).toEqual({ ok: true })
+    expect(beginInflight(db, "exact", "key-exact", NOW - FIVE_MINUTES_MS)).toEqual({ ok: true })
+
+    expireInflight(db, NOW)
+
+    expect(readInflight(db, "stale")).toBeNull()
+    expect(readInflight(db, "exact")?.startedAt).toBe(NOW - FIVE_MINUTES_MS)
+
+    db.close()
+  })
+
+  it("clearInflight then read returns null", () => {
+    const db = openLimits(":memory:")
+    expect(beginInflight(db, SID, KEY, NOW)).toEqual({ ok: true })
+
+    clearInflight(db, SID)
+
+    expect(readInflight(db, SID)).toBeNull()
+
+    db.close()
+  })
+
+  it("stores the image prompt and has no page_text column", () => {
+    const db = openLimits(":memory:")
+    expect(beginInflight(db, SID, KEY, NOW)).toEqual({ ok: true })
+    completeInflight(db, SID, {
+      projectId: "proj-lantern",
+      moment: "The landing",
+      imagePrompt: "A lantern in a stairwell.",
+      creditsCharged: 5,
+    })
+
+    const cell = db.prepare<[string], { image_prompt: string }>(
+      "select image_prompt from inflight where sid = ?",
+    ).get(SID)
+    expect(cell?.image_prompt).toBe("A lantern in a stairwell.")
+    expect(readInflight(db, SID)).not.toBeNull()
+
+    const columns = db
+      .prepare<[], { name: string }>("select name from pragma_table_info('inflight')")
+      .all()
+    expect(columns.map((column) => column.name)).toEqual([
+      "sid",
+      "idempotency_key",
+      "project_id",
+      "moment",
+      "image_prompt",
+      "credits_charged",
+      "started_at",
+    ])
+    expect(columns.map((column) => column.name)).not.toContain("page_text")
+
+    db.close()
+  })
+
+  it("completeInflight does nothing when the sid is missing", () => {
+    const db = openLimits(":memory:")
+
+    completeInflight(db, "missing", {
+      projectId: "proj-lantern",
+      moment: "The landing",
+      imagePrompt: "A lantern in a stairwell.",
+      creditsCharged: 5,
+    })
+
+    expect(readInflight(db, "missing")).toBeNull()
 
     db.close()
   })

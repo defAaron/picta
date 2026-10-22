@@ -190,7 +190,8 @@ describe("POST /api/transcribe", () => {
     const tables = db
       .prepare("select name from sqlite_master where type = 'table' and name not like 'sqlite_%'")
       .all() as Array<{ name: string }>
-    expect(tables).toEqual([{ name: "windows" }])
+    expect(tables.map((table) => table.name).sort()).toEqual(["inflight", "windows"])
+    expect(db.prepare("select * from inflight").all()).toEqual([])
 
     const rows = db.prepare("select * from windows").all() as Array<Record<string, unknown>>
     expect(rows.length).toBeGreaterThan(0)

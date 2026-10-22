@@ -23,6 +23,42 @@ const CREATE_WINDOWS = `
   )
 `
 
+const CREATE_INFLIGHT = `
+  create table if not exists inflight (
+    sid text primary key,
+    idempotency_key text not null,
+    project_id text,
+    moment text,
+    image_prompt text,
+    credits_charged integer,
+    started_at integer not null
+  )
+`
+
+const INFLIGHT_MAX_AGE_MS = 5 * 60 * 1000
+
+export type InflightRow = {
+  sid: string
+  idempotencyKey: string
+  projectId: string | null
+  moment: string | null
+  imagePrompt: string | null
+  creditsCharged: number | null
+  startedAt: number
+}
+
+type InflightSqlRow = {
+  sid: string
+  idempotency_key: string
+  project_id: string | null
+  moment: string | null
+  image_prompt: string | null
+  credits_charged: number | null
+  started_at: number
+}
+
+type BeginInflightResult = { ok: true } | { ok: false; reason: "in_progress" | "busy" }
+
 export function openLimits(filename?: string): LimitsDb {
   const file = filename ?? DEFAULT_FILENAME
   if (file !== ":memory:") {
@@ -30,6 +66,7 @@ export function openLimits(filename?: string): LimitsDb {
   }
   const db = new Database(file)
   db.exec(CREATE_WINDOWS)
+  db.exec(CREATE_INFLIGHT)
   return db
 }
 
@@ -114,5 +151,107 @@ export function releaseScene(db: LimitsDb, sessionId: string, ip: string): void 
     decrement.run(`sid:${sessionId}:scene`)
     decrement.run(`ip:${ip}:scene`)
   })
+  run()
+}
+
+function selectInflight(db: LimitsDb, sid: string): InflightSqlRow | undefined {
+  return db
+    .prepare<[string], InflightSqlRow>(
+      `select sid, idempotency_key, project_id, moment, image_prompt, credits_charged, started_at
+       from inflight
+       where sid = ?`,
+    )
+    .get(sid)
+}
+
+function toInflightRow(row: InflightSqlRow): InflightRow {
+  return {
+    sid: row.sid,
+    idempotencyKey: row.idempotency_key,
+    projectId: row.project_id,
+    moment: row.moment,
+    imagePrompt: row.image_prompt,
+    creditsCharged: row.credits_charged,
+    startedAt: row.started_at,
+  }
+}
+
+export function beginInflight(
+  db: LimitsDb,
+  sid: string,
+  idempotencyKey: string,
+  nowMs: number,
+): BeginInflightResult {
+  const run = db.transaction((): BeginInflightResult => {
+    const row = selectInflight(db, sid)
+    if (row === undefined) {
+      db.prepare<[string, string, number]>(
+        `insert into inflight (
+           sid, idempotency_key, project_id, moment, image_prompt, credits_charged, started_at
+         ) values (?, ?, null, null, null, null, ?)`,
+      ).run(sid, idempotencyKey, nowMs)
+      return { ok: true }
+    }
+
+    if (row.idempotency_key !== idempotencyKey) {
+      return { ok: false, reason: "busy" }
+    }
+
+    if (row.project_id === null) {
+      return { ok: false, reason: "in_progress" }
+    }
+
+    return { ok: true }
+  })
+
+  return run()
+}
+
+export function readInflight(db: LimitsDb, sid: string): InflightRow | null {
+  const run = db.transaction((): InflightRow | null => {
+    const row = selectInflight(db, sid)
+    return row === undefined ? null : toInflightRow(row)
+  })
+
+  return run()
+}
+
+export function completeInflight(
+  db: LimitsDb,
+  sid: string,
+  fields: {
+    projectId: string
+    moment: string
+    imagePrompt: string
+    creditsCharged: number
+  },
+): void {
+  const run = db.transaction(() => {
+    db.prepare<[string, string, string, number, string]>(
+      `update inflight
+       set project_id = ?, moment = ?, image_prompt = ?, credits_charged = ?
+       where sid = ?`,
+    ).run(fields.projectId, fields.moment, fields.imagePrompt, fields.creditsCharged, sid)
+  })
+
+  run()
+}
+
+export function clearInflight(db: LimitsDb, sid: string): void {
+  const run = db.transaction(() => {
+    db.prepare<[string]>("delete from inflight where sid = ?").run(sid)
+  })
+
+  run()
+}
+
+export function expireInflight(db: LimitsDb, nowMs: number): void {
+  const run = db.transaction(() => {
+    db.prepare<[number, number]>("delete from inflight where (? - started_at) > ?").run(
+      nowMs,
+      INFLIGHT_MAX_AGE_MS,
+    )
+  })
+
   run()
 }
