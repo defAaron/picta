@@ -1,6 +1,6 @@
 # Picta implementation plan
 
-> **For the orchestrator:** Follow `.cursor/rules/problem-orchestration.mdc` and `docs/implementation/process.md`. Deliver one numbered problem, then stop. Do not use a plan that keeps going through later problems in the same turn.
+> **For the orchestrator:** Follow `.cursor/rules/problem-orchestration.mdc` and `docs/implementation/process.md`. Deliver one numbered problem, then stop. After it is finished, stagger the commits the way `process.md` describes: several commits per problem, never one. Do not use a plan that keeps going through later problems in the same turn.
 
 **Goal:** A browser reading of up to 8 book pages, with a confirmed Magic Hour budget and one scene per tapped page.
 

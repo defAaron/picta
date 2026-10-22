@@ -23,7 +23,7 @@ Do these in order. Then stop.
 1. Run `npm test`. Fix failures inside this problem only.
 2. Run the security checks below if this problem added a route, an env file, a parser, or a provider client.
 3. Replace `docs/implementation/handoff.md` using the handoff format below.
-4. Commit the problem, including the handoff, in one commit. Do not push. Do not commit `.env`, `data/`, or `*.sqlite`.
+4. Stagger the problem into several commits, as in Git below. The handoff is the last of those commits. Do not push. Do not commit `.env`, `data/`, or `*.sqlite`.
 5. Reply with the summary format below.
 6. Start `npm run dev`. If port 3000 is taken, use the port Next prints. Put the URL in the reply.
 
@@ -80,7 +80,7 @@ Replace the whole file. Keep it under one screen.
 
 ## Security checks
 
-Run these before the commit. A failed check blocks the commit.
+Run these before the commits. A failed check blocks every commit for this problem.
 
 - `git status` shows no `.env`, `.env.local`, `data/`, or `*.sqlite`. Those patterns are in `.gitignore`. `.env.example` has blank values.
 - Search the diff for `GEMINI_API_KEY`, `MAGIC_HOUR_API_KEY`, and any `Bearer ` value. None are committed. Client components do not read those env names.
@@ -92,7 +92,15 @@ Run these before the commit. A failed check blocks the commit.
 
 ## Git
 
-- One commit per problem, made by the orchestrator after the tests pass.
-- Message: `feat: <problem name in a few words>`
+Subagents do not commit. After the tests and security checks pass, the orchestrator makes the commits.
+
+Stagger the finished problem so a later reader can find one change without reading the whole problem. Judge the boundaries from the waves and subproblems. A library and its tests belong in one commit. A screen and a route are their own commits. Order the commits so each one builds on the previous.
+
+- A smaller problem gets 5–8 commits.
+- A larger problem gets 10–16 commits.
+- Do not put the whole problem in one commit.
+- The handoff is its own last commit for that problem.
+- Message: `feat:` or `docs:`, then what that slice is for, in one or two sentences.
 - Do not push.
+- Do not commit `.env`, `data/`, or `*.sqlite`.
 - Do not amend a commit that was already shown to the user.
