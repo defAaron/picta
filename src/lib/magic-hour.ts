@@ -84,3 +84,114 @@ export function createMockMagicHourClient(): MagicHourClient {
   mocks.set(client, state)
   return client
 }
+
+const LIVE_ORIGIN = "https://api.magichour.ai"
+
+export class InsufficientCreditsError extends Error {
+  constructor() {
+    super("insufficient_credits")
+    this.name = "InsufficientCreditsError"
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json()
+  } catch {
+    throw new Error("magic_hour_request_failed")
+  }
+}
+
+function downloadUrl(body: Record<string, unknown>): string {
+  const downloads = body.downloads
+  const first = Array.isArray(downloads) ? downloads[0] : undefined
+  if (!isRecord(first) || typeof first.url !== "string" || first.url.length === 0) {
+    throw new Error("download_failed")
+  }
+  return first.url
+}
+
+export function createLiveMagicHourClient(
+  apiKey: string,
+  fetchImpl: typeof fetch = fetch,
+): MagicHourClient {
+  const authorization = `Bearer ${apiKey}`
+
+  return {
+    async create(prompt) {
+      const response = await fetchImpl(`${LIVE_ORIGIN}/v1/ai-image-generator`, {
+        method: "POST",
+        headers: {
+          Authorization: authorization,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          image_count: 1,
+          model: "z-image-turbo",
+          aspect_ratio: "1:1",
+          resolution: "640px",
+          style: { prompt, tool: "general" },
+        }),
+      })
+
+      if (response.status === 402) {
+        throw new InsufficientCreditsError()
+      }
+      if (!response.ok) {
+        throw new Error("magic_hour_create_failed")
+      }
+
+      const payload = await readJson(response)
+      if (
+        !isRecord(payload) ||
+        typeof payload.id !== "string" ||
+        typeof payload.credits_charged !== "number"
+      ) {
+        throw new Error("magic_hour_create_failed")
+      }
+
+      return { projectId: payload.id, creditsCharged: payload.credits_charged }
+    },
+
+    async get(projectId) {
+      const response = await fetchImpl(
+        `${LIVE_ORIGIN}/v1/image-projects/${encodeURIComponent(projectId)}`,
+        {
+          method: "GET",
+          headers: { Authorization: authorization },
+        },
+      )
+      if (!response.ok) {
+        throw new Error("magic_hour_status_failed")
+      }
+
+      const payload = await readJson(response)
+      if (!isRecord(payload)) {
+        throw new Error("magic_hour_status_failed")
+      }
+      if (payload.status === "error" || payload.status === "canceled") {
+        return { status: "error" }
+      }
+      if (payload.status !== "complete") {
+        return { status: "rendering" }
+      }
+
+      const image = await fetchImpl(downloadUrl(payload))
+      if (!image.ok) {
+        throw new Error("download_failed")
+      }
+
+      let bytes: Uint8Array
+      try {
+        bytes = new Uint8Array(await image.arrayBuffer())
+      } catch {
+        throw new Error("download_failed")
+      }
+      return { status: "complete", bytes, contentType: "image/png" }
+    },
+  }
+}
