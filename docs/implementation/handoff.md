@@ -1,41 +1,37 @@
 # Handoff
 
-**Finished:** Problem 5 — Live scenes and the page frame
-**Next:** Problem 6 — Security pass
-**Do this next:** Prove the security checklist with tests, and change code only where a check fails. Do not add a feature.
+**Finished:** Problem 6 — Security pass
+**Next:** none — the plan is finished
+**Do this next:** Nothing in the plan. Add `GEMINI_API_KEY` and `MAGIC_HOUR_API_KEY` to `.env.local` when you want live transcription and scenes.
 
 ## Read
 
-- docs/implementation/06-security-pass.md
-- docs/implementation/process.md (security checks)
-- src/app/api/session/route.ts
-- src/app/api/quota/route.ts
-- src/app/api/transcribe/route.ts
-- src/app/api/scenes/route.ts
-- src/app/api/scenes/shared.ts
-- src/app/api/scenes/[projectId]/route.ts
-- src/lib/magic-hour.ts
-- src/lib/compose.ts
+- docs/implementation/process.md (security checks only)
 
 ## Do not read
 
-- docs/implementation/01-local-reading.md
-- docs/implementation/02-session-and-limits.md
-- docs/implementation/03-transcribe.md
-- docs/implementation/04-illustrate.md
-- docs/implementation/05-live-scenes-and-page-frame.md
-- src/lib/pages.ts, src/lib/budget.ts, and src/lib/reading-store.ts
 - docs/prd.md and docs/architecture.md
+
+## Checklist
+
+| Check | Proof |
+| --- | --- |
+| `.env`, `.env.local`, `data/`, and `*.sqlite` are gitignored. `.env.example` values are empty. | `src/lib/security.test.ts` |
+| No secret in `src/` except `test-key` and the live `Bearer ${apiKey}` header. | `src/lib/security.test.ts` |
+| A bad body never calls a provider. | `src/app/api/transcribe/route.test.ts`, `src/app/api/scenes/route.test.ts` |
+| A rate limit refuses before Gemini or Magic Hour. | `src/app/api/transcribe/route.test.ts`, `src/app/api/scenes/route.test.ts` |
+| Page text is not the image prompt and is not stored. | `src/app/api/scenes/route.test.ts`, `src/lib/limits.test.ts` |
+| Logs do not contain page text, prompts, photos, or keys. | `src/lib/security.test.ts` |
+| `X-Forwarded-For` is ignored unless `TRUSTED_PROXY` is `true`. | `src/lib/client-ip.test.ts`, `src/app/api/quota/route.test.ts` |
+| Routes that use SQLite set `runtime = "nodejs"`. | `src/lib/security.test.ts` |
+| Client components do not import the Magic Hour, Gemini, or limits modules. | `src/lib/security.test.ts` |
+| `allowed: false` does not call Magic Hour. | `src/app/api/scenes/route.test.ts` |
 
 ## Trust these
 
-- `createLiveMagicHourClient(apiKey, fetchImpl?)` — posts to `https://api.magichour.ai/v1/ai-image-generator` with `Authorization: Bearer` plus the key argument. Body is `z-image-turbo`, `image_count` 1, `resolution` `640px`, `aspect_ratio` `1:1`, `style.tool` `general`, and `style.prompt` is the image prompt. HTTP 402 throws `InsufficientCreditsError`. `get` reads `downloads[0].url` and downloads it without the bearer token.
-- `createMockMagicHourClient()` — still the client when `MAGIC_HOUR_API_KEY` is empty. POST then includes `"simulated": true`.
-- A missing `GEMINI_API_KEY` with no injected client returns 502 `{ "error": "illustrate_unavailable" }` and does not invent a prompt.
-- `sceneFrame(1000, 2000)` — `{ x: 80, y: 1160, width: 840, height: 840 }`. The frame is inset 8% on each side and is the lower 42% of the photo.
-- `OnPageView` — draws that frame. The reading screen shows “See it on the page” only when the page has a photo and a complete scene image.
-- The caption “Simulated scene” is shown only when `scene.simulated` is true.
+- `npm test` — 107 passed, 1 skipped. The skipped test is the PNG compose check, because this Node process has no `OffscreenCanvas`.
+- Live calls happen only when the matching key is set. Tests use fake fetch and the literal `test-key`.
 
 ## Do not redo
 
-Pasting, the quota dialog, transcription, and the Illustrate poll already work. Do not change credit numbers, model ids, or caps. Do not call live Gemini or Magic Hour from the test suite.
+The reading screen, the quota, transcription, the mock scene, and the live client are finished. Do not add a button, a route, or a screen for this pass.
