@@ -21,4 +21,5 @@ export type Scene = {
   creditsCharged: number
   status: "rendering" | "complete" | "download_failed"
   image: Blob | null
+  simulated?: boolean
 }

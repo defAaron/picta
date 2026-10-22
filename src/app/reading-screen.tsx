@@ -5,6 +5,7 @@ import { estimateCredits, maxConfirmable, nextBudget } from "@/lib/budget"
 import { joinPages, splitPageAt, splitPaste } from "@/lib/pages"
 import { clearReading, loadReading, saveReading } from "@/lib/reading-store"
 import type { Page, Reading, Scene } from "@/lib/types"
+import { OnPageView } from "./on-page-view"
 
 type Caret = {
   start: number
@@ -83,6 +84,7 @@ type AllowedScene = {
   moment: string
   imagePrompt: string
   creditsCharged: number
+  simulated?: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -105,7 +107,7 @@ function isRejectedScene(value: unknown): value is { allowed: false; reason: str
   return isRecord(value) && value.allowed === false && typeof value.reason === "string"
 }
 
-function SimulatedScene({ image }: { image: Blob }) {
+function SceneImage({ image, simulated }: { image: Blob; simulated: boolean }) {
   const [src, setSrc] = useState<string | null>(null)
 
   useEffect(() => {
@@ -118,8 +120,8 @@ function SimulatedScene({ image }: { image: Blob }) {
 
   return (
     <figure className="scene-frame">
-      {src ? <img src={src} alt="Simulated scene" /> : null}
-      <figcaption>Simulated scene</figcaption>
+      {src ? <img src={src} alt={simulated ? "Simulated scene" : "Scene"} /> : null}
+      {simulated ? <figcaption>Simulated scene</figcaption> : null}
     </figure>
   )
 }
@@ -157,6 +159,7 @@ export default function ReadingScreen() {
   const [pageNotes, setPageNotes] = useState<Record<string, string>>({})
   const [awaitingCheck, setAwaitingCheck] = useState<Record<string, boolean>>({})
   const [illustrateBusy, setIllustrateBusy] = useState(false)
+  const [onPageId, setOnPageId] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -450,6 +453,7 @@ export default function ReadingScreen() {
     setIllustrateBusy(false)
     setPageNotes({})
     setAwaitingCheck({})
+    setOnPageId(null)
     canSaveRef.current = false
     saveChainRef.current = saveChainRef.current
       .catch(() => undefined)
@@ -598,7 +602,8 @@ export default function ReadingScreen() {
   async function pollProject(pageId: string, projectId: string): Promise<"rendering" | "settled"> {
     const epoch = readingEpoch.current
     const page = readingRef.current?.pages.find((item) => item.id === pageId)
-    if (!page?.scene || page.scene.projectId !== projectId || page.scene.status !== "rendering") {
+    if (!page?.scene || page.scene.projectId !== projectId) return "settled"
+    if (page.scene.status !== "rendering" && page.scene.status !== "download_failed") {
       return "settled"
     }
     if (pollBusy.current[pageId]) return "rendering"
@@ -672,7 +677,7 @@ export default function ReadingScreen() {
   async function checkAgain(pageId: string) {
     if (checkLocks.current[pageId]) return
     const page = readingRef.current?.pages.find((item) => item.id === pageId)
-    if (!page?.scene || page.scene.status !== "rendering") return
+    if (!page?.scene || (page.scene.status !== "rendering" && page.scene.status !== "download_failed")) return
     const projectId = page.scene.projectId
     const epoch = readingEpoch.current
     checkLocks.current[pageId] = true
@@ -686,7 +691,13 @@ export default function ReadingScreen() {
       }
       if (readingEpoch.current !== epoch) return
       const latest = readingRef.current?.pages.find((item) => item.id === pageId)
-      if (!latest?.scene || latest.scene.status !== "rendering" || latest.scene.projectId !== projectId) return
+      if (
+        !latest?.scene ||
+        latest.scene.projectId !== projectId ||
+        (latest.scene.status !== "rendering" && latest.scene.status !== "download_failed")
+      ) {
+        return
+      }
       const outcome = await pollProject(pageId, projectId)
       if (readingEpoch.current !== epoch) return
       if (outcome !== "rendering") return
@@ -701,10 +712,12 @@ export default function ReadingScreen() {
 
   function noteForStatus(status: number, error: string | null): string {
     if (status === 400) return "That page could not be illustrated."
+    if (status === 402) return "Picta is out of image credits."
     if (status === 409) return "That illustration is already in progress."
     if (status === 429) {
       return error === "busy" ? "Another illustration is still running." : "The illustration limit is full."
     }
+    if (status === 502) return "Couldn't start the scene."
     return "Illustration is unavailable."
   }
 
@@ -771,6 +784,7 @@ export default function ReadingScreen() {
       creditsCharged: payload.creditsCharged,
       status: "rendering",
       image: null,
+      simulated: payload.simulated === true,
     }
     const saved = persist({
       ...latest,
@@ -885,7 +899,18 @@ export default function ReadingScreen() {
                         onKeyUp={(event) => rememberCaret(page.id, event.currentTarget)}
                         onClick={(event) => rememberCaret(page.id, event.currentTarget)}
                       />
-                      {sceneImage ? <SimulatedScene image={sceneImage} /> : null}
+                      {sceneImage ? (
+                        <SceneImage image={sceneImage} simulated={page.scene?.simulated === true} />
+                      ) : null}
+                      {onPageId === page.id && page.photo && sceneImage ? (
+                        <div className="on-page-overlay">
+                          <OnPageView
+                            photo={page.photo}
+                            scene={sceneImage}
+                            onClose={() => setOnPageId(null)}
+                          />
+                        </div>
+                      ) : null}
                     </div>
                     {page.scene?.status === "rendering" && !awaitingCheck[page.id] ? (
                       <p className="reading-message">Illustrating…</p>
@@ -924,7 +949,13 @@ export default function ReadingScreen() {
                           Illustrate
                         </button>
                       ) : null}
-                      {page.scene?.status === "rendering" && awaitingCheck[page.id] ? (
+                      {page.photo && sceneImage ? (
+                        <button type="button" onClick={() => setOnPageId(page.id)}>
+                          See it on the page
+                        </button>
+                      ) : null}
+                      {page.scene?.status === "download_failed" ||
+                      (page.scene?.status === "rendering" && awaitingCheck[page.id]) ? (
                         <button type="button" onClick={() => void checkAgain(page.id)}>
                           Check again
                         </button>
