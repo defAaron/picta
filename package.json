@@ -1,0 +1,21 @@
+{
+  "name": "picta",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "next": "^16.4.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "fake-indexeddb": "^6.2.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
