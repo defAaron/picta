@@ -41,6 +41,15 @@ function blankPage(text: string): Page {
   }
 }
 
+function isPhotoPayload(
+  value: unknown,
+): value is { accepted: true; text: string } | { accepted: false; reason: string } {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  if (record.accepted === true && typeof record.text === "string") return true
+  return record.accepted === false && typeof record.reason === "string"
+}
+
 function isQuotaPayload(value: unknown): value is {
   sceneCreatesRemaining: number
   sceneWindowResetsAt: number
@@ -60,6 +69,8 @@ export default function ReadingScreen() {
   const [reading, setReading] = useState<Reading | null>(null)
   const [paste, setPaste] = useState("")
   const [pasteError, setPasteError] = useState<string | null>(null)
+  const [photoMessage, setPhotoMessage] = useState<string | null>(null)
+  const [photoBusy, setPhotoBusy] = useState(false)
   const [sceneCount, setSceneCount] = useState("")
   const [carets, setCarets] = useState<Record<string, Caret>>({})
   const [quota, setQuota] = useState<QuotaStatus>({ status: "loading" })
@@ -153,6 +164,90 @@ export default function ReadingScreen() {
       if (previous?.start === start && previous.end === end) return current
       return { ...current, [pageId]: { start, end } }
     })
+  }
+
+  function choosePhoto(input: HTMLInputElement) {
+    const file = input.files?.[0]
+    input.value = ""
+    if (!file) return
+    setPhotoMessage(null)
+    if (!canSaveRef.current) return
+    if ((readingRef.current?.pages.length ?? 0) >= 8) {
+      setPhotoMessage("This reading already has 8 pages.")
+      return
+    }
+    void sendPhoto(file)
+  }
+
+  async function sendPhoto(file: File) {
+    setPhotoBusy(true)
+    try {
+      const body = new FormData()
+      body.append("image", file)
+      let response: Response
+      try {
+        response = await fetch("/api/transcribe", {
+          method: "POST",
+          credentials: "same-origin",
+          body,
+        })
+      } catch {
+        setPhotoMessage("Transcription is unavailable.")
+        return
+      }
+      if (response.status === 400) {
+        setPhotoMessage("Choose a JPEG, PNG, or WebP photo under 8 MB.")
+        return
+      }
+      if (response.status === 429) {
+        setPhotoMessage("The transcription limit is full.")
+        return
+      }
+      if (!response.ok) {
+        setPhotoMessage("Transcription is unavailable.")
+        return
+      }
+      let payload: unknown
+      try {
+        payload = await response.json()
+      } catch {
+        setPhotoMessage("Transcription is unavailable.")
+        return
+      }
+      if (!isPhotoPayload(payload)) {
+        setPhotoMessage("Transcription is unavailable.")
+        return
+      }
+      if (!payload.accepted) {
+        setPhotoMessage(payload.reason)
+        return
+      }
+      if (!canSaveRef.current) return
+      const current = readingRef.current
+      if ((current?.pages.length ?? 0) >= 8) {
+        setPhotoMessage("This reading already has 8 pages.")
+        return
+      }
+      const page: Page = {
+        id: crypto.randomUUID(),
+        text: payload.text,
+        photo: file,
+        scene: null,
+      }
+      const next: Reading = current
+        ? { ...current, pages: [...current.pages, page] }
+        : {
+            id: crypto.randomUUID(),
+            createdAt: Date.now(),
+            hasConfirmedBudget: false,
+            budgetRemaining: 0,
+            restoredProjectIds: [],
+            pages: [page],
+          }
+      persist(next)
+    } finally {
+      setPhotoBusy(false)
+    }
   }
 
   function addPages() {
@@ -265,6 +360,7 @@ export default function ReadingScreen() {
         setReading(null)
         setPaste("")
         setPasteError(null)
+        setPhotoMessage(null)
         setSceneCount("")
         setCarets({})
       })
@@ -306,6 +402,20 @@ export default function ReadingScreen() {
                 Add pages
               </button>
             </div>
+          </div>
+
+          <div className="reading-paste">
+            <input
+              className="page-photo"
+              type="file"
+              accept="image/jpeg, image/png, image/webp"
+              aria-label="Add a page photo"
+              disabled={photoBusy}
+              onChange={(event) => {
+                choosePhoto(event.currentTarget)
+              }}
+            />
+            {photoMessage ? <p className="reading-message">{photoMessage}</p> : null}
           </div>
 
           {reading && reading.pages.length > 0 ? (

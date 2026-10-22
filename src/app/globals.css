@@ -75,6 +75,15 @@ body {
   min-height: 8rem;
 }
 
+.page-photo {
+  display: block;
+  max-width: 100%;
+}
+
+.page-photo:disabled {
+  opacity: 0.45;
+}
+
 .page-text {
   min-height: 10rem;
 }
