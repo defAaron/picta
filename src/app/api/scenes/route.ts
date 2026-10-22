@@ -13,9 +13,9 @@ import {
   takeWindow,
   type LimitsDb,
 } from "../../../lib/limits"
-import type { MagicHourClient } from "../../../lib/magic-hour"
+import { InsufficientCreditsError, type MagicHourClient } from "../../../lib/magic-hour"
 import { attachSessionCookie, resolveSessionId } from "../session/route"
-import { defaultMagicHour, getLimitsDb } from "./shared"
+import { getLimitsDb, resolveMagicHour } from "./shared"
 
 export const runtime = "nodejs"
 
@@ -25,8 +25,6 @@ const SESSION_GEMINI_CAP = 20
 const IP_GEMINI_CAP = 60
 const SESSION_SCENE_CAP = 8
 const IP_SCENE_CAP = 20
-const FALLBACK_MOMENT = "A quiet corner of the page"
-const FALLBACK_PROMPT = "A lantern in a stairwell."
 const CANNOT_ILLUSTRATE = "This page can't be illustrated."
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -122,6 +120,31 @@ function refusalReason(result: IllustrateResult, moment: string, imagePrompt: st
   return CANNOT_ILLUSTRATE
 }
 
+function allowedScenePayload(
+  projectId: string,
+  moment: string,
+  imagePrompt: string,
+  creditsCharged: number,
+  simulated: boolean,
+): {
+  allowed: true
+  projectId: string
+  moment: string
+  imagePrompt: string
+  creditsCharged: number
+  simulated?: true
+} {
+  const body = {
+    allowed: true as const,
+    projectId,
+    moment,
+    imagePrompt,
+    creditsCharged,
+  }
+  if (!simulated) return body
+  return { ...body, simulated: true }
+}
+
 function injectedDeps(second: SceneDeps | ScenesContext | undefined): SceneDeps {
   if (second === undefined || "params" in second) return {}
   return second
@@ -155,13 +178,18 @@ export async function POST(
   const existing = readInflight(db, session.id)
   if (existing !== null && existing.idempotencyKey === page.idempotencyKey) {
     if (existing.projectId !== null) {
-      return json(request, session, {
-        allowed: true,
-        projectId: existing.projectId,
-        moment: existing.moment ?? "",
-        imagePrompt: existing.imagePrompt ?? "",
-        creditsCharged: existing.creditsCharged ?? 0,
-      })
+      const { simulated } = resolveMagicHour(injected.magicHour)
+      return json(
+        request,
+        session,
+        allowedScenePayload(
+          existing.projectId,
+          existing.moment ?? "",
+          existing.imagePrompt ?? "",
+          existing.creditsCharged ?? 0,
+          simulated,
+        ),
+      )
     }
     return json(request, session, { error: "in_progress" }, 409)
   }
@@ -183,27 +211,22 @@ export async function POST(
   }
 
   const gemini = resolveGemini(injected.gemini)
-  let illustrated: IllustrateResult
   if (gemini === null) {
-    illustrated = {
-      allowed: true,
-      rejectReason: null,
-      moment: FALLBACK_MOMENT,
-      imagePrompt: FALLBACK_PROMPT,
-    }
-  } else {
-    const geminiReset = takeGemini(db, session.id, ip, nowMs)
-    if (geminiReset !== null) {
-      clearInflight(db, session.id)
-      return json(request, session, { error: "rate_limited", resetsAt: geminiReset }, 429)
-    }
-    const parsed = await illustratePage(gemini, page.pageText)
-    if (!parsed.ok) {
-      clearInflight(db, session.id)
-      return json(request, session, { error: "illustrate_unavailable" }, 502)
-    }
-    illustrated = parsed.result
+    clearInflight(db, session.id)
+    return json(request, session, { error: "illustrate_unavailable" }, 502)
   }
+
+  const geminiReset = takeGemini(db, session.id, ip, nowMs)
+  if (geminiReset !== null) {
+    clearInflight(db, session.id)
+    return json(request, session, { error: "rate_limited", resetsAt: geminiReset }, 429)
+  }
+  const parsed = await illustratePage(gemini, page.pageText)
+  if (!parsed.ok) {
+    clearInflight(db, session.id)
+    return json(request, session, { error: "illustrate_unavailable" }, 502)
+  }
+  const illustrated = parsed.result
 
   const moment = illustrated.moment.trim()
   const imagePrompt = illustrated.imagePrompt.trim()
@@ -220,7 +243,7 @@ export async function POST(
     return json(request, session, { error: "rate_limited", resetsAt: scene.resetsAt }, 429)
   }
 
-  const magicHour = injected.magicHour ?? defaultMagicHour()
+  const { client: magicHour, simulated } = resolveMagicHour(injected.magicHour)
   try {
     const created = await magicHour.create(imagePrompt)
     completeInflight(db, session.id, {
@@ -229,16 +252,17 @@ export async function POST(
       imagePrompt,
       creditsCharged: created.creditsCharged,
     })
-    return json(request, session, {
-      allowed: true,
-      projectId: created.projectId,
-      moment,
-      imagePrompt,
-      creditsCharged: created.creditsCharged,
-    })
-  } catch {
+    return json(
+      request,
+      session,
+      allowedScenePayload(created.projectId, moment, imagePrompt, created.creditsCharged, simulated),
+    )
+  } catch (error) {
     releaseScene(db, session.id, ip)
     clearInflight(db, session.id)
+    if (error instanceof InsufficientCreditsError) {
+      return json(request, session, { error: "insufficient_credits" }, 402)
+    }
     return json(request, session, { error: "illustrate_unavailable" }, 502)
   }
 }

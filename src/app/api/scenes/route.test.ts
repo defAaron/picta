@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
+import { clientIp } from "../../../lib/client-ip"
 import type { GeminiClient } from "../../../lib/gemini"
 import { beginInflight, readInflight, takeWindow, type LimitsDb } from "../../../lib/limits"
 import { createMockMagicHourClient, mockPrompts } from "../../../lib/magic-hour"
@@ -146,7 +147,9 @@ describe("POST /api/scenes", () => {
 
     const first = await POST(postJson("First page.", sid), deps)
     expect(first.status).toBe(200)
-    expect((await first.json()).allowed).toBe(true)
+    const firstBody = await first.json()
+    expect(firstBody.allowed).toBe(true)
+    expect(firstBody.simulated).toBe(true)
 
     const second = await POST(postJson("Second page.", sid), deps)
     expect(second.status).toBe(429)
@@ -169,6 +172,7 @@ describe("POST /api/scenes", () => {
     expect(second.status).toBe(200)
     expect(await second.json()).toEqual(firstBody)
     expect(firstBody.projectId).toEqual(expect.any(String))
+    expect(firstBody.simulated).toBe(true)
     expect(mockPrompts(magicHour)).toHaveLength(1)
     expect(gemini.calls).toHaveLength(1)
   })
@@ -197,6 +201,7 @@ describe("POST /api/scenes", () => {
     const response = await POST(postJson("SECRET_PAGE_TEXT", sid), { gemini: gemini.client, magicHour })
 
     expect(response.status).toBe(200)
+    expect((await response.json()).simulated).toBe(true)
     expect(gemini.calls).toEqual(["SECRET_PAGE_TEXT"])
     const windows = db.prepare("select * from windows").all() as Array<Record<string, unknown>>
     const inflight = db.prepare("select * from inflight").all() as Array<Record<string, unknown>>
@@ -208,28 +213,55 @@ describe("POST /api/scenes", () => {
     expect(inflight.find((row) => row.sid === sid)?.image_prompt).toBe("A lantern in a stairwell.")
   })
 
-  it("uses the fixed lantern prompt when the Gemini key is unset", async () => {
+  it("returns 502 when the Gemini key is unset and does not invent a prompt", async () => {
     delete process.env.GEMINI_API_KEY
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network disabled"))
     try {
       const sid = newSid()
       const db = limitsForTests()
-      const pageText = "Mice in the margin."
       const magicHour = createMockMagicHourClient()
 
-      const response = await POST(postJson(pageText, sid), { magicHour })
-      const body = await response.json()
+      const response = await POST(postJson("Mice in the margin.", sid), { magicHour })
 
-      expect(response.status).toBe(200)
-      expect(body.allowed).toBe(true)
-      expect(body.moment).toBe("A quiet corner of the page")
-      expect(body.imagePrompt).toBe("A lantern in a stairwell.")
-      expect(body.creditsCharged).toBe(5)
-      expect(mockPrompts(magicHour)).toEqual(["A lantern in a stairwell."])
+      expect(response.status).toBe(502)
+      expect(await response.json()).toEqual({ error: "illustrate_unavailable" })
+      expect(mockPrompts(magicHour)).toEqual([])
       expect(fetchSpy).not.toHaveBeenCalled()
+      expect(readInflight(db, sid)).toBeNull()
       expect(windowCount(db, `sid:${sid}:gemini`)).toBe(0)
+      expect(windowCount(db, `sid:${sid}:scene`)).toBe(0)
     } finally {
       fetchSpy.mockRestore()
+    }
+  })
+
+  it("returns 402 when live Magic Hour has no credits and rolls the scene window back", async () => {
+    const previousKey = process.env.MAGIC_HOUR_API_KEY
+    process.env.MAGIC_HOUR_API_KEY = "test-key"
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+      if (!url.endsWith("/v1/ai-image-generator")) throw new Error("unexpected fetch")
+      return new Response(null, { status: 402 })
+    })
+    try {
+      const sid = newSid()
+      const db = limitsForTests()
+      const ip = clientIp(new Headers(), null)
+      const ipBefore = windowCount(db, `ip:${ip}:scene`)
+      const gemini = illustratingClient(() => allowedScene("A lantern in a stairwell."))
+
+      const response = await POST(postJson("A page.", sid), { gemini: gemini.client })
+
+      expect(response.status).toBe(402)
+      expect(await response.json()).toEqual({ error: "insufficient_credits" })
+      expect(fetchSpy).toHaveBeenCalledTimes(1)
+      expect(windowCount(db, `sid:${sid}:scene`)).toBe(0)
+      expect(windowCount(db, `ip:${ip}:scene`)).toBe(ipBefore)
+      expect(readInflight(db, sid)).toBeNull()
+    } finally {
+      fetchSpy.mockRestore()
+      if (previousKey === undefined) delete process.env.MAGIC_HOUR_API_KEY
+      else process.env.MAGIC_HOUR_API_KEY = previousKey
     }
   })
 

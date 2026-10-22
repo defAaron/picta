@@ -3,7 +3,7 @@ import { clientIp } from "../../../../lib/client-ip"
 import { clearInflight, expireInflight, readInflight, releaseScene } from "../../../../lib/limits"
 import type { MagicHourClient } from "../../../../lib/magic-hour"
 import { attachSessionCookie, resolveSessionId } from "../../session/route"
-import { defaultMagicHour, getLimitsDb } from "../shared"
+import { getLimitsDb, resolveMagicHour } from "../shared"
 
 export const runtime = "nodejs"
 
@@ -34,7 +34,7 @@ export async function GET(
     return json(request, session, { error: "not_found" }, 404)
   }
 
-  const magicHour = deps?.magicHour ?? defaultMagicHour()
+  const magicHour = resolveMagicHour(deps?.magicHour).client
   try {
     const result = await magicHour.get(projectId)
     if (result.status === "rendering") {

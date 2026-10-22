@@ -1,5 +1,9 @@
 import { openLimits, type LimitsDb } from "../../../lib/limits"
-import { createMockMagicHourClient, type MagicHourClient } from "../../../lib/magic-hour"
+import {
+  createLiveMagicHourClient,
+  createMockMagicHourClient,
+  type MagicHourClient,
+} from "../../../lib/magic-hour"
 
 let limitsDatabase: LimitsDb | undefined
 let magicHourClient: MagicHourClient | undefined
@@ -16,6 +20,20 @@ export function defaultMagicHour(): MagicHourClient {
     magicHourClient = createMockMagicHourClient()
   }
   return magicHourClient
+}
+
+export function resolveMagicHour(injected?: MagicHourClient): {
+  client: MagicHourClient
+  simulated: boolean
+} {
+  if (injected !== undefined) {
+    return { client: injected, simulated: true }
+  }
+  const apiKey = process.env.MAGIC_HOUR_API_KEY
+  if (typeof apiKey === "string" && apiKey.length > 0) {
+    return { client: createLiveMagicHourClient(apiKey), simulated: false }
+  }
+  return { client: defaultMagicHour(), simulated: true }
 }
 
 export function limitsForTests(): LimitsDb {

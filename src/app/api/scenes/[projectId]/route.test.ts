@@ -63,8 +63,9 @@ async function createScene(sid: string, magicHour: MagicHourClient): Promise<str
     magicHour,
   })
   expect(response.status).toBe(200)
-  const body = await response.json() as { allowed: boolean; projectId: string }
+  const body = (await response.json()) as { allowed: boolean; projectId: string; simulated?: boolean }
   expect(body.allowed).toBe(true)
+  expect(body.simulated).toBe(true)
   return body.projectId
 }
 
