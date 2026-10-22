@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react"
 import { estimateCredits, maxConfirmable, nextBudget } from "@/lib/budget"
 import { joinPages, splitPageAt, splitPaste } from "@/lib/pages"
 import { clearReading, loadReading, saveReading } from "@/lib/reading-store"
-import type { Page, Reading } from "@/lib/types"
+import type { Page, Reading, Scene } from "@/lib/types"
 
 type Caret = {
   start: number
@@ -64,6 +64,66 @@ function isQuotaPayload(value: unknown): value is {
   )
 }
 
+const SCENE_POLL_MS = 2000
+const SCENE_POLL_LIMIT_MS = 3 * 60 * 1000
+
+type AttemptKey = {
+  key: string
+  replacingProjectId: string | null
+}
+
+type PollHandle = {
+  interval: ReturnType<typeof setInterval>
+  timeout: ReturnType<typeof setTimeout>
+}
+
+type AllowedScene = {
+  allowed: true
+  projectId: string
+  moment: string
+  imagePrompt: string
+  creditsCharged: number
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function isAllowedScene(value: unknown): value is AllowedScene {
+  if (!isRecord(value) || value.allowed !== true) return false
+  return (
+    typeof value.projectId === "string" &&
+    value.projectId.length > 0 &&
+    typeof value.moment === "string" &&
+    typeof value.imagePrompt === "string" &&
+    typeof value.creditsCharged === "number" &&
+    Number.isFinite(value.creditsCharged)
+  )
+}
+
+function isRejectedScene(value: unknown): value is { allowed: false; reason: string } {
+  return isRecord(value) && value.allowed === false && typeof value.reason === "string"
+}
+
+function SimulatedScene({ image }: { image: Blob }) {
+  const [src, setSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    const url = URL.createObjectURL(image)
+    setSrc(url)
+    return () => {
+      URL.revokeObjectURL(url)
+    }
+  }, [image])
+
+  return (
+    <figure className="scene-frame">
+      {src ? <img src={src} alt="Simulated scene" /> : null}
+      <figcaption>Simulated scene</figcaption>
+    </figure>
+  )
+}
+
 export default function ReadingScreen() {
   const [phase, setPhase] = useState<Phase>("loading")
   const [reading, setReading] = useState<Reading | null>(null)
@@ -79,6 +139,24 @@ export default function ReadingScreen() {
   const readingRef = useRef<Reading | null>(null)
   const canSaveRef = useRef(false)
   const saveChainRef = useRef(Promise.resolve())
+  const budgetCountRef = useRef<HTMLInputElement>(null)
+  const attemptKeys = useRef<Record<string, AttemptKey>>({})
+  const pollTimers = useRef<Record<string, PollHandle>>({})
+  const pollBusy = useRef<Record<string, boolean>>({})
+  const checkLocks = useRef<Record<string, boolean>>({})
+  const postingRef = useRef(false)
+  const readingEpoch = useRef(0)
+  const pollingApi = useRef<{
+    start: (pageId: string, projectId: string) => void
+    stopAll: () => void
+  }>({
+    start: () => undefined,
+    stopAll: () => undefined,
+  })
+
+  const [pageNotes, setPageNotes] = useState<Record<string, string>>({})
+  const [awaitingCheck, setAwaitingCheck] = useState<Record<string, boolean>>({})
+  const [illustrateBusy, setIllustrateBusy] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -139,6 +217,21 @@ export default function ReadingScreen() {
       cancelled = true
     }
   }, [budgetOpen])
+
+  useEffect(() => {
+    if (phase !== "ready") return
+    const stored = readingRef.current
+    if (stored) {
+      for (const page of stored.pages) {
+        if (page.scene?.status === "rendering") {
+          pollingApi.current.start(page.id, page.scene.projectId)
+        }
+      }
+    }
+    return () => {
+      pollingApi.current.stopAll()
+    }
+  }, [phase])
 
   function persist(next: Reading): boolean {
     if (!canSaveRef.current) return false
@@ -350,6 +443,13 @@ export default function ReadingScreen() {
   function startOver() {
     if (!readingRef.current) return
     if (!window.confirm("Start over and remove this reading?")) return
+    readingEpoch.current += 1
+    stopAllPolling()
+    attemptKeys.current = {}
+    postingRef.current = false
+    setIllustrateBusy(false)
+    setPageNotes({})
+    setAwaitingCheck({})
     canSaveRef.current = false
     saveChainRef.current = saveChainRef.current
       .catch(() => undefined)
@@ -369,6 +469,344 @@ export default function ReadingScreen() {
       })
   }
 
+  function clearPageNote(pageId: string) {
+    setPageNotes((current) => {
+      if (!(pageId in current)) return current
+      const next = { ...current }
+      delete next[pageId]
+      return next
+    })
+  }
+
+  function clearAwaitingCheck(pageId: string) {
+    setAwaitingCheck((current) => {
+      if (!current[pageId]) return current
+      const next = { ...current }
+      delete next[pageId]
+      return next
+    })
+  }
+
+  function stopPolling(pageId: string) {
+    const timer = pollTimers.current[pageId]
+    if (!timer) return
+    clearInterval(timer.interval)
+    clearTimeout(timer.timeout)
+    delete pollTimers.current[pageId]
+  }
+
+  function stopAllPolling() {
+    for (const pageId of Object.keys(pollTimers.current)) stopPolling(pageId)
+  }
+
+  function keyForPost(pageId: string, scene: Scene | null, replacing: boolean): string {
+    const current = attemptKeys.current[pageId]
+    if (replacing && scene) {
+      if (current?.replacingProjectId === scene.projectId) return current.key
+      const key = crypto.randomUUID()
+      attemptKeys.current[pageId] = { key, replacingProjectId: scene.projectId }
+      return key
+    }
+    if (current) return current.key
+    const key = crypto.randomUUID()
+    attemptKeys.current[pageId] = { key, replacingProjectId: null }
+    return key
+  }
+
+  function focusBudget() {
+    const input = budgetCountRef.current
+    if (!input) return
+    input.scrollIntoView({ block: "center" })
+    input.focus()
+  }
+
+  async function readErrorCode(response: Response): Promise<string | null> {
+    try {
+      const body: unknown = await response.json()
+      if (isRecord(body) && typeof body.error === "string") return body.error
+    } catch {
+      return null
+    }
+    return null
+  }
+
+  async function storeCompletedScene(pageId: string, projectId: string, image: Blob, epoch: number) {
+    if (readingEpoch.current !== epoch) return
+    const latest = readingRef.current
+    if (!latest) return
+    const page = latest.pages.find((item) => item.id === pageId)
+    if (!page?.scene || page.scene.projectId !== projectId) return
+    const saved = persist({
+      ...latest,
+      pages: latest.pages.map((item) =>
+        item.id === pageId && item.scene?.projectId === projectId
+          ? { ...item, scene: { ...item.scene, status: "complete", image } }
+          : item,
+      ),
+    })
+    if (!saved) return
+    clearAwaitingCheck(pageId)
+    clearPageNote(pageId)
+    const pending = saveChainRef.current
+    await pending
+    if (readingEpoch.current !== epoch) return
+    const after = readingRef.current?.pages.find((item) => item.id === pageId)
+    if (after?.scene?.projectId !== projectId || after.scene.status !== "complete" || !after.scene.image) return
+    try {
+      await fetch(`/api/scenes/${encodeURIComponent(projectId)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+        cache: "no-store",
+      })
+    } catch {
+      return
+    }
+  }
+
+  function restoreRefund(pageId: string, projectId: string) {
+    const latest = readingRef.current
+    if (!latest) return
+    if (latest.restoredProjectIds.includes(projectId)) return
+    const page = latest.pages.find((item) => item.id === pageId)
+    if (!page?.scene || page.scene.projectId !== projectId) return
+    persist({
+      ...latest,
+      budgetRemaining: latest.budgetRemaining + 1,
+      restoredProjectIds: [...latest.restoredProjectIds, projectId],
+      pages: latest.pages.map((item) => (item.id === pageId ? { ...item, scene: null } : item)),
+    })
+    clearAwaitingCheck(pageId)
+    clearPageNote(pageId)
+  }
+
+  function markDownloadFailed(pageId: string, projectId: string) {
+    const latest = readingRef.current
+    if (!latest) return
+    const page = latest.pages.find((item) => item.id === pageId)
+    if (!page?.scene || page.scene.projectId !== projectId) return
+    persist({
+      ...latest,
+      pages: latest.pages.map((item) =>
+        item.id === pageId && item.scene?.projectId === projectId
+          ? { ...item, scene: { ...item.scene, status: "download_failed" } }
+          : item,
+      ),
+    })
+    clearAwaitingCheck(pageId)
+  }
+
+  async function pollProject(pageId: string, projectId: string): Promise<"rendering" | "settled"> {
+    const epoch = readingEpoch.current
+    const page = readingRef.current?.pages.find((item) => item.id === pageId)
+    if (!page?.scene || page.scene.projectId !== projectId || page.scene.status !== "rendering") {
+      return "settled"
+    }
+    if (pollBusy.current[pageId]) return "rendering"
+    pollBusy.current[pageId] = true
+    try {
+      let response: Response
+      try {
+        response = await fetch(`/api/scenes/${encodeURIComponent(projectId)}`, {
+          credentials: "same-origin",
+          cache: "no-store",
+        })
+      } catch {
+        return "rendering"
+      }
+      if (readingEpoch.current !== epoch) return "settled"
+
+      if (response.status === 502) {
+        const error = await readErrorCode(response)
+        if (readingEpoch.current !== epoch) return "settled"
+        if (error === "download_failed") {
+          markDownloadFailed(pageId, projectId)
+          return "settled"
+        }
+        return "rendering"
+      }
+
+      const pictaStatus = response.headers.get("X-Picta-Status")
+      const contentType = response.headers.get("content-type") ?? ""
+      if (pictaStatus === "complete" || contentType.includes("image/png")) {
+        const image = await response.blob()
+        await storeCompletedScene(pageId, projectId, image, epoch)
+        return "settled"
+      }
+
+      let payload: unknown
+      try {
+        payload = await response.json()
+      } catch {
+        return "rendering"
+      }
+      if (readingEpoch.current !== epoch) return "settled"
+      if (isRecord(payload) && payload.status === "refunded") {
+        restoreRefund(pageId, projectId)
+        return "settled"
+      }
+      return "rendering"
+    } finally {
+      pollBusy.current[pageId] = false
+    }
+  }
+
+  function startPolling(pageId: string, projectId: string) {
+    stopPolling(pageId)
+    clearAwaitingCheck(pageId)
+    const interval = setInterval(() => {
+      if (pollBusy.current[pageId]) return
+      void pollProject(pageId, projectId).then((outcome) => {
+        if (outcome !== "rendering") stopPolling(pageId)
+      })
+    }, SCENE_POLL_MS)
+    const timeout = setTimeout(() => {
+      stopPolling(pageId)
+      const page = readingRef.current?.pages.find((item) => item.id === pageId)
+      if (page?.scene?.status === "rendering" && page.scene.projectId === projectId) {
+        setAwaitingCheck((current) => ({ ...current, [pageId]: true }))
+      }
+    }, SCENE_POLL_LIMIT_MS)
+    pollTimers.current[pageId] = { interval, timeout }
+  }
+
+  async function checkAgain(pageId: string) {
+    if (checkLocks.current[pageId]) return
+    const page = readingRef.current?.pages.find((item) => item.id === pageId)
+    if (!page?.scene || page.scene.status !== "rendering") return
+    const projectId = page.scene.projectId
+    const epoch = readingEpoch.current
+    checkLocks.current[pageId] = true
+    clearAwaitingCheck(pageId)
+    try {
+      while (pollBusy.current[pageId]) {
+        if (readingEpoch.current !== epoch) return
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, 50)
+        })
+      }
+      if (readingEpoch.current !== epoch) return
+      const latest = readingRef.current?.pages.find((item) => item.id === pageId)
+      if (!latest?.scene || latest.scene.status !== "rendering" || latest.scene.projectId !== projectId) return
+      const outcome = await pollProject(pageId, projectId)
+      if (readingEpoch.current !== epoch) return
+      if (outcome !== "rendering") return
+      const after = readingRef.current?.pages.find((item) => item.id === pageId)
+      if (after?.scene?.status === "rendering" && after.scene.projectId === projectId) {
+        startPolling(pageId, projectId)
+      }
+    } finally {
+      delete checkLocks.current[pageId]
+    }
+  }
+
+  function noteForStatus(status: number, error: string | null): string {
+    if (status === 400) return "That page could not be illustrated."
+    if (status === 409) return "That illustration is already in progress."
+    if (status === 429) {
+      return error === "busy" ? "Another illustration is still running." : "The illustration limit is full."
+    }
+    return "Illustration is unavailable."
+  }
+
+  async function requestScene(pageId: string, pageText: string, key: string) {
+    const epoch = readingEpoch.current
+    clearPageNote(pageId)
+    let response: Response
+    try {
+      response = await fetch("/api/scenes", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": key,
+        },
+        body: JSON.stringify({ pageText }),
+      })
+    } catch {
+      if (readingEpoch.current !== epoch) return
+      setPageNotes((notes) => ({ ...notes, [pageId]: "Illustration is unavailable." }))
+      return
+    }
+    if (readingEpoch.current !== epoch) return
+
+    if (!response.ok) {
+      const error = response.status === 429 || response.status === 502 ? await readErrorCode(response) : null
+      if (readingEpoch.current !== epoch) return
+      setPageNotes((notes) => ({ ...notes, [pageId]: noteForStatus(response.status, error) }))
+      return
+    }
+
+    let payload: unknown
+    try {
+      payload = await response.json()
+    } catch {
+      if (readingEpoch.current !== epoch) return
+      setPageNotes((notes) => ({ ...notes, [pageId]: "Illustration is unavailable." }))
+      return
+    }
+    if (readingEpoch.current !== epoch) return
+
+    if (isRejectedScene(payload)) {
+      setPageNotes((notes) => ({ ...notes, [pageId]: payload.reason }))
+      return
+    }
+    if (!isAllowedScene(payload)) {
+      setPageNotes((notes) => ({ ...notes, [pageId]: "Illustration is unavailable." }))
+      return
+    }
+
+    const latest = readingRef.current
+    if (!latest) return
+    const page = latest.pages.find((item) => item.id === pageId)
+    if (!page) return
+    if (page.scene?.projectId === payload.projectId && page.scene.status === "complete" && page.scene.image) {
+      return
+    }
+    const sameProject = page.scene?.projectId === payload.projectId
+    const scene: Scene = {
+      projectId: payload.projectId,
+      moment: payload.moment,
+      imagePrompt: payload.imagePrompt,
+      creditsCharged: payload.creditsCharged,
+      status: "rendering",
+      image: null,
+    }
+    const saved = persist({
+      ...latest,
+      budgetRemaining: sameProject ? latest.budgetRemaining : Math.max(0, latest.budgetRemaining - 1),
+      pages: latest.pages.map((item) => (item.id === pageId ? { ...item, scene } : item)),
+    })
+    if (!saved) return
+    startPolling(pageId, payload.projectId)
+  }
+
+  function illustratePage(pageId: string) {
+    const current = readingRef.current
+    if (!current || !canSaveRef.current || postingRef.current) return
+    const page = current.pages.find((item) => item.id === pageId)
+    if (!page) return
+    if (current.pages.some((item) => item.scene?.status === "rendering")) return
+
+    const replacing = page.scene?.status === "complete"
+    if (replacing && !window.confirm("Replace this scene?")) return
+    if (!current.hasConfirmedBudget || current.budgetRemaining === 0) {
+      setPageNotes((notes) => ({ ...notes, [pageId]: "Confirm a scene budget first." }))
+      focusBudget()
+      return
+    }
+
+    const key = keyForPost(pageId, page.scene, replacing)
+    postingRef.current = true
+    setIllustrateBusy(true)
+    void requestScene(pageId, page.text, key).finally(() => {
+      postingRef.current = false
+      setIllustrateBusy(false)
+    })
+  }
+
+  pollingApi.current = { start: startPolling, stopAll: stopAllPolling }
+
   const enteredCount = parseSceneCount(sceneCount)
   const sceneCreatesRemaining = quota.status === "ready" ? quota.sceneCreatesRemaining : null
   const confirmCap =
@@ -381,6 +819,7 @@ export default function ReadingScreen() {
       : 0
   const confirmDisabled =
     sceneCreatesRemaining === null || enteredCount === null || enteredCount < 1 || enteredCount > confirmCap
+  const illustrationRunning = reading?.pages.some((page) => page.scene?.status === "rendering") ?? false
 
   return (
     <div className="reading-screen">
@@ -428,17 +867,33 @@ export default function ReadingScreen() {
                 const split = collapsed ? splitPageAt(page.text, caret.start) : null
                 const showJoin = joined?.ok === true
                 const showSplit = reading.pages.length < 8 && split?.ok === true
+                const showIllustrate =
+                  page.scene === null ||
+                  page.scene.status === "complete" ||
+                  page.scene.status === "download_failed"
+                const sceneImage =
+                  page.scene?.status === "complete" && page.scene.image ? page.scene.image : null
                 return (
                   <article className="page-card" key={page.id}>
-                    <textarea
-                      className="page-text"
-                      value={page.text}
-                      aria-label={`Page ${index + 1}`}
-                      onChange={(event) => changePageText(page.id, event.target.value)}
-                      onSelect={(event) => rememberCaret(page.id, event.currentTarget)}
-                      onKeyUp={(event) => rememberCaret(page.id, event.currentTarget)}
-                      onClick={(event) => rememberCaret(page.id, event.currentTarget)}
-                    />
+                    <div className="page-body">
+                      <textarea
+                        className="page-text"
+                        value={page.text}
+                        aria-label={`Page ${index + 1}`}
+                        onChange={(event) => changePageText(page.id, event.target.value)}
+                        onSelect={(event) => rememberCaret(page.id, event.currentTarget)}
+                        onKeyUp={(event) => rememberCaret(page.id, event.currentTarget)}
+                        onClick={(event) => rememberCaret(page.id, event.currentTarget)}
+                      />
+                      {sceneImage ? <SimulatedScene image={sceneImage} /> : null}
+                    </div>
+                    {page.scene?.status === "rendering" && !awaitingCheck[page.id] ? (
+                      <p className="reading-message">Illustrating…</p>
+                    ) : null}
+                    {page.scene?.status === "download_failed" ? (
+                      <p className="reading-message">The scene could not be downloaded.</p>
+                    ) : null}
+                    {pageNotes[page.id] ? <p className="reading-message">{pageNotes[page.id]}</p> : null}
                     <div className="action-row">
                       <button type="button" onClick={() => movePage(index, -1)} disabled={index === 0}>
                         Move earlier
@@ -460,6 +915,20 @@ export default function ReadingScreen() {
                           Split
                         </button>
                       ) : null}
+                      {showIllustrate ? (
+                        <button
+                          type="button"
+                          onClick={() => illustratePage(page.id)}
+                          disabled={illustrationRunning || illustrateBusy}
+                        >
+                          Illustrate
+                        </button>
+                      ) : null}
+                      {page.scene?.status === "rendering" && awaitingCheck[page.id] ? (
+                        <button type="button" onClick={() => void checkAgain(page.id)}>
+                          Check again
+                        </button>
+                      ) : null}
                     </div>
                   </article>
                 )
@@ -477,6 +946,7 @@ export default function ReadingScreen() {
                 <p>The scene limit resets at {new Date(quota.sceneWindowResetsAt).toLocaleString()}.</p>
               ) : null}
               <input
+                ref={budgetCountRef}
                 className="budget-count"
                 type="number"
                 step={1}
