@@ -6,11 +6,13 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "next": "^16.4.2",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.6.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
