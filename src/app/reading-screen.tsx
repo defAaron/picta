@@ -13,6 +13,11 @@ type Caret = {
 
 type Phase = "loading" | "error" | "ready"
 
+type QuotaStatus =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "ready"; sceneCreatesRemaining: number; sceneWindowResetsAt: number }
+
 function pasteFailure(reason: "empty" | "too_long" | "too_many_pages"): string {
   if (reason === "empty") return "That excerpt is empty."
   if (reason === "too_long") return "That excerpt is too long."
@@ -36,6 +41,20 @@ function blankPage(text: string): Page {
   }
 }
 
+function isQuotaPayload(value: unknown): value is {
+  sceneCreatesRemaining: number
+  sceneWindowResetsAt: number
+} {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  return (
+    typeof record.sceneCreatesRemaining === "number" &&
+    Number.isFinite(record.sceneCreatesRemaining) &&
+    typeof record.sceneWindowResetsAt === "number" &&
+    Number.isFinite(record.sceneWindowResetsAt)
+  )
+}
+
 export default function ReadingScreen() {
   const [phase, setPhase] = useState<Phase>("loading")
   const [reading, setReading] = useState<Reading | null>(null)
@@ -43,6 +62,8 @@ export default function ReadingScreen() {
   const [pasteError, setPasteError] = useState<string | null>(null)
   const [sceneCount, setSceneCount] = useState("")
   const [carets, setCarets] = useState<Record<string, Caret>>({})
+  const [quota, setQuota] = useState<QuotaStatus>({ status: "loading" })
+  const [quotaOpen, setQuotaOpen] = useState(false)
 
   const readingRef = useRef<Reading | null>(null)
   const canSaveRef = useRef(false)
@@ -66,6 +87,47 @@ export default function ReadingScreen() {
       cancelled = true
     }
   }, [])
+
+  const budgetOpen = reading !== null && reading.pages.length > 0
+  if (budgetOpen !== quotaOpen) {
+    setQuotaOpen(budgetOpen)
+    setQuota({ status: "loading" })
+  }
+
+  useEffect(() => {
+    if (!budgetOpen) return
+    let cancelled = false
+    async function loadQuota() {
+      try {
+        const sessionResponse = await fetch("/api/session", {
+          method: "POST",
+          credentials: "same-origin",
+        })
+        if (!sessionResponse.ok) throw new Error("session")
+        const quotaResponse = await fetch("/api/quota", {
+          credentials: "same-origin",
+        })
+        if (!quotaResponse.ok) throw new Error("quota")
+        const body: unknown = await quotaResponse.json()
+        if (cancelled) return
+        if (!isQuotaPayload(body)) {
+          setQuota({ status: "error" })
+          return
+        }
+        setQuota({
+          status: "ready",
+          sceneCreatesRemaining: body.sceneCreatesRemaining,
+          sceneWindowResetsAt: body.sceneWindowResetsAt,
+        })
+      } catch {
+        if (!cancelled) setQuota({ status: "error" })
+      }
+    }
+    void loadQuota()
+    return () => {
+      cancelled = true
+    }
+  }, [budgetOpen])
 
   function persist(next: Reading): boolean {
     if (!canSaveRef.current) return false
@@ -175,12 +237,12 @@ export default function ReadingScreen() {
 
   function confirmBudget() {
     const current = readingRef.current
-    if (!current || !canSaveRef.current) return
+    if (!current || !canSaveRef.current || quota.status !== "ready") return
     const count = parseSceneCount(sceneCount)
     const cap = maxConfirmable({
       isFirstConfirmation: !current.hasConfirmedBudget,
       pagesWithoutScene: current.pages.filter((page) => page.scene === null).length,
-      sceneCreatesRemaining: 8,
+      sceneCreatesRemaining: quota.sceneCreatesRemaining,
     })
     if (count === null || count < 1 || count > cap) return
     persist({
@@ -212,14 +274,17 @@ export default function ReadingScreen() {
   }
 
   const enteredCount = parseSceneCount(sceneCount)
-  const confirmCap = reading
-    ? maxConfirmable({
-        isFirstConfirmation: !reading.hasConfirmedBudget,
-        pagesWithoutScene: reading.pages.filter((page) => page.scene === null).length,
-        sceneCreatesRemaining: 8,
-      })
-    : 0
-  const confirmDisabled = enteredCount === null || enteredCount < 1 || enteredCount > confirmCap
+  const sceneCreatesRemaining = quota.status === "ready" ? quota.sceneCreatesRemaining : null
+  const confirmCap =
+    reading && sceneCreatesRemaining !== null
+      ? maxConfirmable({
+          isFirstConfirmation: !reading.hasConfirmedBudget,
+          pagesWithoutScene: reading.pages.filter((page) => page.scene === null).length,
+          sceneCreatesRemaining,
+        })
+      : 0
+  const confirmDisabled =
+    sceneCreatesRemaining === null || enteredCount === null || enteredCount < 1 || enteredCount > confirmCap
 
   return (
     <div className="reading-screen">
@@ -295,6 +360,12 @@ export default function ReadingScreen() {
           {reading && reading.pages.length > 0 ? (
             <section className="budget">
               <p>Remaining budget: {reading.budgetRemaining}</p>
+              {quota.status === "error" ? <p>The limit could not be loaded.</p> : null}
+              {quota.status === "ready" &&
+              quota.sceneCreatesRemaining === 0 &&
+              quota.sceneWindowResetsAt > 0 ? (
+                <p>The scene limit resets at {new Date(quota.sceneWindowResetsAt).toLocaleString()}.</p>
+              ) : null}
               <input
                 className="budget-count"
                 type="number"
