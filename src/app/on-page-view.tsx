@@ -52,8 +52,8 @@ export function OnPageView({
   }, [photo, scene])
 
   return (
-    <div>
-      <canvas ref={canvasRef} style={{ display: "block", maxWidth: "100%", height: "auto" }} />
+    <div className="on-page-sheet">
+      <canvas ref={canvasRef} />
       <button type="button" onClick={onClose}>
         Close
       </button>

@@ -1,36 +1,30 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
-import { estimateCredits, maxConfirmable, nextBudget } from "@/lib/budget"
-import { joinPages, splitPageAt, splitPaste } from "@/lib/pages"
+import { useEffect, useRef, useState, type DragEvent, type FormEvent, type MouseEvent } from "react"
+import {
+  canSubmitKeys,
+  GEMINI_KEY_HEADER,
+  MAGIC_HOUR_KEY_HEADER,
+  MAX_API_KEY_LENGTH,
+  usableApiKey,
+} from "@/lib/api-key-headers"
+import { directScenePrompt, MAX_DIRECT_PROMPT } from "@/lib/direct-scene"
 import { clearReading, loadReading, saveReading } from "@/lib/reading-store"
 import type { Page, Reading, Scene } from "@/lib/types"
 import { OnPageView } from "./on-page-view"
 
-type Caret = {
-  start: number
-  end: number
-}
+const MAX_EXCERPT = 5000
 
 type Phase = "loading" | "error" | "ready"
 
-type QuotaStatus =
-  | { status: "loading" }
-  | { status: "error" }
-  | { status: "ready"; sceneCreatesRemaining: number; sceneWindowResetsAt: number }
+type PendingAction =
+  | { kind: "photo"; file: File }
+  | { kind: "scene"; pageId: string }
+  | { kind: "poll"; pageId: string; projectId: string }
 
-function pasteFailure(reason: "empty" | "too_long" | "too_many_pages"): string {
-  if (reason === "empty") return "That excerpt is empty."
-  if (reason === "too_long") return "That excerpt is too long."
-  return "That excerpt has too many pages."
-}
-
-function parseSceneCount(value: string): number | null {
-  const trimmed = value.trim()
-  if (!/^[0-9]+$/.test(trimmed)) return null
-  const count = Number(trimmed)
-  if (!Number.isInteger(count) || !Number.isFinite(count)) return null
-  return count
+type KeyMemory = {
+  gemini: "unset" | "server" | { typed: string }
+  magicHour: string | null
 }
 
 function blankPage(text: string): Page {
@@ -49,20 +43,6 @@ function isPhotoPayload(
   const record = value as Record<string, unknown>
   if (record.accepted === true && typeof record.text === "string") return true
   return record.accepted === false && typeof record.reason === "string"
-}
-
-function isQuotaPayload(value: unknown): value is {
-  sceneCreatesRemaining: number
-  sceneWindowResetsAt: number
-} {
-  if (typeof value !== "object" || value === null) return false
-  const record = value as Record<string, unknown>
-  return (
-    typeof record.sceneCreatesRemaining === "number" &&
-    Number.isFinite(record.sceneCreatesRemaining) &&
-    typeof record.sceneWindowResetsAt === "number" &&
-    Number.isFinite(record.sceneWindowResetsAt)
-  )
 }
 
 const SCENE_POLL_MS = 2000
@@ -107,6 +87,91 @@ function isRejectedScene(value: unknown): value is { allowed: false; reason: str
   return isRecord(value) && value.allowed === false && typeof value.reason === "string"
 }
 
+function KeyField({
+  id,
+  label,
+  value,
+  onChange,
+}: {
+  id: string
+  label: string
+  value: string
+  onChange: (value: string) => void
+}) {
+  return (
+    <label className="key-field light-capsule" htmlFor={id}>
+      <span className="key-field__label">{label}</span>
+      <input
+        id={id}
+        type="password"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={`Enter your ${label}`}
+        autoComplete="off"
+        spellCheck={false}
+      />
+      <span className="key-field__seal" aria-hidden="true">
+        ✦
+      </span>
+    </label>
+  )
+}
+
+function PageCorners({ side }: { side: "left" | "right" }) {
+  return (
+    <>
+      <div className={`page__corner page__corner--top-${side}`} />
+      <div className={`page__corner page__corner--bottom-${side}`} />
+    </>
+  )
+}
+
+function FrameOrnaments() {
+  return (
+    <>
+      <div className="mystery-frame__ornament mystery-frame__ornament--top" />
+      <div className="mystery-frame__ornament mystery-frame__ornament--bottom" />
+    </>
+  )
+}
+
+function PhotoPreview({ image }: { image: Blob }) {
+  const [src, setSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    const url = URL.createObjectURL(image)
+    setSrc(url)
+    return () => {
+      URL.revokeObjectURL(url)
+    }
+  }, [image])
+
+  if (!src) return null
+  return <img src={src} alt="Uploaded page" />
+}
+
+function geminiHint(input: {
+  purpose: "photo" | "scene"
+  requireTypedGemini: boolean
+  serverHasGemini: boolean
+}): string {
+  if (input.purpose === "photo") {
+    if (input.requireTypedGemini) return "The server key was rejected. Enter a Gemini key to read the photo."
+    if (input.serverHasGemini) return "Leave the Gemini key blank to use the key on this server."
+    return "A Gemini key is needed to read a photo."
+  }
+  if (input.requireTypedGemini) {
+    return "The server Gemini key was rejected. Enter another, or leave it blank to send your description straight to Magic Hour."
+  }
+  if (input.serverHasGemini) return "Leave the Gemini key blank to use the key on this server."
+  return "Gemini is optional. Without it, your description goes straight to Magic Hour, up to 1,500 characters."
+}
+
+function followLight(event: MouseEvent<HTMLElement>) {
+  event.currentTarget.style.setProperty("--lx", `${event.clientX}px`)
+  event.currentTarget.style.setProperty("--ly", `${event.clientY}px`)
+}
+
 function SceneImage({ image, simulated }: { image: Blob; simulated: boolean }) {
   const [src, setSrc] = useState<string | null>(null)
 
@@ -118,12 +183,8 @@ function SceneImage({ image, simulated }: { image: Blob; simulated: boolean }) {
     }
   }, [image])
 
-  return (
-    <figure className="scene-frame">
-      {src ? <img src={src} alt={simulated ? "Simulated scene" : "Scene"} /> : null}
-      {simulated ? <figcaption>Simulated scene</figcaption> : null}
-    </figure>
-  )
+  if (!src) return null
+  return <img src={src} alt={simulated ? "Simulated scene" : "Scene"} />
 }
 
 export default function ReadingScreen() {
@@ -133,15 +194,12 @@ export default function ReadingScreen() {
   const [pasteError, setPasteError] = useState<string | null>(null)
   const [photoMessage, setPhotoMessage] = useState<string | null>(null)
   const [photoBusy, setPhotoBusy] = useState(false)
-  const [sceneCount, setSceneCount] = useState("")
-  const [carets, setCarets] = useState<Record<string, Caret>>({})
-  const [quota, setQuota] = useState<QuotaStatus>({ status: "loading" })
-  const [quotaOpen, setQuotaOpen] = useState(false)
+  const [photoOver, setPhotoOver] = useState(false)
+  const [chosenPhoto, setChosenPhoto] = useState<File | null>(null)
 
   const readingRef = useRef<Reading | null>(null)
   const canSaveRef = useRef(false)
   const saveChainRef = useRef(Promise.resolve())
-  const budgetCountRef = useRef<HTMLInputElement>(null)
   const attemptKeys = useRef<Record<string, AttemptKey>>({})
   const pollTimers = useRef<Record<string, PollHandle>>({})
   const pollBusy = useRef<Record<string, boolean>>({})
@@ -160,16 +218,34 @@ export default function ReadingScreen() {
   const [awaitingCheck, setAwaitingCheck] = useState<Record<string, boolean>>({})
   const [illustrateBusy, setIllustrateBusy] = useState(false)
   const [onPageId, setOnPageId] = useState<string | null>(null)
+  const [keyDialogOpen, setKeyDialogOpen] = useState(false)
+  const [keyMessage, setKeyMessage] = useState<string | null>(null)
+  const [geminiDraft, setGeminiDraft] = useState("")
+  const [magicHourDraft, setMagicHourDraft] = useState("")
+  const [serverHasGemini, setServerHasGemini] = useState(false)
+  const [requireTypedGemini, setRequireTypedGemini] = useState(false)
+  const [keyConfigLoading, setKeyConfigLoading] = useState(true)
+  const [keyAsk, setKeyAsk] = useState<PendingAction["kind"] | null>(null)
+  const [workPhase, setWorkPhase] = useState<"writing" | "sending" | null>(null)
+
+  const keysRef = useRef<KeyMemory>({ gemini: "unset", magicHour: null })
+  const requireTypedGeminiRef = useRef(false)
+  const dialogOpenRef = useRef(false)
+  const keysDismissedRef = useRef(false)
+  const pendingActionRef = useRef<PendingAction | null>(null)
 
   useEffect(() => {
     let cancelled = false
     loadReading()
       .then((stored) => {
         if (cancelled) return
-        readingRef.current = stored
+        const single =
+          stored && stored.pages.length > 1 ? { ...stored, pages: stored.pages.slice(0, 1) } : stored
+        readingRef.current = single
         canSaveRef.current = true
-        setReading(stored)
+        setReading(single)
         setPhase("ready")
+        if (single && stored && stored.pages.length > 1) void saveReading(single)
       })
       .catch(() => {
         if (cancelled) return
@@ -180,49 +256,9 @@ export default function ReadingScreen() {
     }
   }, [])
 
-  const budgetOpen = reading !== null && reading.pages.length > 0
-  if (budgetOpen !== quotaOpen) {
-    setQuotaOpen(budgetOpen)
-    setQuota({ status: "loading" })
-  }
-
-  useEffect(() => {
-    if (!budgetOpen) return
-    let cancelled = false
-    async function loadQuota() {
-      try {
-        const sessionResponse = await fetch("/api/session", {
-          method: "POST",
-          credentials: "same-origin",
-        })
-        if (!sessionResponse.ok) throw new Error("session")
-        const quotaResponse = await fetch("/api/quota", {
-          credentials: "same-origin",
-        })
-        if (!quotaResponse.ok) throw new Error("quota")
-        const body: unknown = await quotaResponse.json()
-        if (cancelled) return
-        if (!isQuotaPayload(body)) {
-          setQuota({ status: "error" })
-          return
-        }
-        setQuota({
-          status: "ready",
-          sceneCreatesRemaining: body.sceneCreatesRemaining,
-          sceneWindowResetsAt: body.sceneWindowResetsAt,
-        })
-      } catch {
-        if (!cancelled) setQuota({ status: "error" })
-      }
-    }
-    void loadQuota()
-    return () => {
-      cancelled = true
-    }
-  }, [budgetOpen])
-
   useEffect(() => {
     if (phase !== "ready") return
+    void refreshServerGemini()
     const stored = readingRef.current
     if (stored) {
       for (const page of stored.pages) {
@@ -235,6 +271,31 @@ export default function ReadingScreen() {
       pollingApi.current.stopAll()
     }
   }, [phase])
+
+  useEffect(() => {
+    const magicHour = usableApiKey(magicHourDraft)
+    if (magicHour === null) {
+      if (magicHourDraft.trim() === "") {
+        keysRef.current = { gemini: keysRef.current.gemini, magicHour: null }
+      }
+      return
+    }
+    const gemini = usableApiKey(geminiDraft)
+    if (gemini !== null) {
+      keysRef.current = { gemini: { typed: gemini }, magicHour }
+      if (requireTypedGeminiRef.current) {
+        requireTypedGeminiRef.current = false
+        setRequireTypedGemini(false)
+      }
+      return
+    }
+    if (geminiDraft.trim() === "") {
+      keysRef.current = {
+        gemini: serverHasGemini && !requireTypedGeminiRef.current ? "server" : "unset",
+        magicHour,
+      }
+    }
+  }, [geminiDraft, magicHourDraft, serverHasGemini])
 
   function persist(next: Reading): boolean {
     if (!canSaveRef.current) return false
@@ -251,32 +312,150 @@ export default function ReadingScreen() {
     return true
   }
 
-  function rememberCaret(pageId: string, element: HTMLTextAreaElement) {
-    const start = element.selectionStart
-    const end = element.selectionEnd
-    if (start === null || end === null) return
-    setCarets((current) => {
-      const previous = current[pageId]
-      if (previous?.start === start && previous.end === end) return current
-      return { ...current, [pageId]: { start, end } }
-    })
+  function geminiHeaders(): Record<string, string> {
+    const gemini = keysRef.current.gemini
+    if (typeof gemini === "object") return { [GEMINI_KEY_HEADER]: gemini.typed }
+    return {}
+  }
+
+  function magicHeaders(): Record<string, string> {
+    const magicHour = keysRef.current.magicHour
+    if (magicHour === null) return {}
+    return { [MAGIC_HOUR_KEY_HEADER]: magicHour }
+  }
+
+  function providerKeysReady(kind: "photo" | "scene" | "poll"): boolean {
+    if (keysRef.current.magicHour === null) return false
+    if (kind === "photo") return keysRef.current.gemini !== "unset"
+    return true
+  }
+
+  async function refreshServerGemini() {
+    setKeyConfigLoading(true)
+    try {
+      const response = await fetch("/api/quota", { credentials: "same-origin", cache: "no-store" })
+      if (!response.ok) {
+        setServerHasGemini(false)
+        return
+      }
+      const body: unknown = await response.json()
+      setServerHasGemini(isRecord(body) && body.geminiConfigured === true)
+    } catch {
+      setServerHasGemini(false)
+    } finally {
+      setKeyConfigLoading(false)
+    }
+  }
+
+  function openKeyDialog(pending: PendingAction, message: string | null) {
+    pendingActionRef.current = pending
+    dialogOpenRef.current = true
+    keysDismissedRef.current = false
+    setKeyMessage(message)
+    setKeyAsk(pending.kind)
+    setKeyDialogOpen(true)
+    void refreshServerGemini()
+  }
+
+  function rememberKeys(geminiRequired: boolean): boolean {
+    const magicHour = usableApiKey(magicHourDraft)
+    if (magicHour === null) return false
+    const gemini = usableApiKey(geminiDraft)
+    if (gemini !== null) {
+      keysRef.current = { gemini: { typed: gemini }, magicHour }
+      requireTypedGeminiRef.current = false
+      setRequireTypedGemini(false)
+      return true
+    }
+    if (geminiDraft.trim().length > MAX_API_KEY_LENGTH) return false
+    if (serverHasGemini && !requireTypedGeminiRef.current) {
+      keysRef.current = { gemini: "server", magicHour }
+      return true
+    }
+    if (!geminiRequired) {
+      keysRef.current = { gemini: "unset", magicHour }
+      return true
+    }
+    return false
+  }
+
+  function rejectKeys(sentTypedGemini: boolean, pending: PendingAction) {
+    keysRef.current = { gemini: "unset", magicHour: null }
+    requireTypedGeminiRef.current = !sentTypedGemini
+    setRequireTypedGemini(!sentTypedGemini)
+    setGeminiDraft("")
+    setMagicHourDraft("")
+    openKeyDialog(pending, "Those keys were rejected.")
+  }
+
+  function rejectMagicHour(pending: PendingAction) {
+    keysRef.current = { gemini: keysRef.current.gemini, magicHour: null }
+    setMagicHourDraft("")
+    openKeyDialog(pending, "That Magic Hour key was rejected.")
+  }
+
+  function cancelKeys() {
+    const pending = pendingActionRef.current
+    pendingActionRef.current = null
+    if (pending?.kind === "poll") keysDismissedRef.current = true
+    if (pending?.kind === "photo") setChosenPhoto(null)
+    dialogOpenRef.current = false
+    setKeyDialogOpen(false)
+    setKeyAsk(null)
+    setKeyMessage(null)
+  }
+
+  function submitKeys(event: FormEvent) {
+    event.preventDefault()
+    const pending = pendingActionRef.current
+    if (!rememberKeys(pending?.kind === "photo")) return
+    pendingActionRef.current = null
+    dialogOpenRef.current = false
+    keysDismissedRef.current = false
+    setKeyDialogOpen(false)
+    setKeyAsk(null)
+    setKeyMessage(null)
+    if (pending?.kind === "photo") void sendPhoto(pending.file)
+    if (pending?.kind === "scene") illustratePage(pending.pageId)
+    if (pending?.kind === "poll") {
+      void pollProject(pending.pageId, pending.projectId).then((outcome) => {
+        if (outcome === "rendering") startPolling(pending.pageId, pending.projectId)
+      })
+    }
+  }
+
+  function takePhotoFile(file: File | undefined) {
+    if (!file) return
+    if (file.type !== "image/jpeg" && file.type !== "image/png" && file.type !== "image/webp") {
+      setPhotoMessage("Choose a JPEG, PNG, or WebP photo under 8 MB.")
+      return
+    }
+    setPhotoMessage(null)
+    if (!canSaveRef.current) return
+    setChosenPhoto(file)
+    void sendPhoto(file)
   }
 
   function choosePhoto(input: HTMLInputElement) {
     const file = input.files?.[0]
     input.value = ""
-    if (!file) return
-    setPhotoMessage(null)
-    if (!canSaveRef.current) return
-    if ((readingRef.current?.pages.length ?? 0) >= 8) {
-      setPhotoMessage("This reading already has 8 pages.")
-      return
-    }
-    void sendPhoto(file)
+    takePhotoFile(file)
+  }
+
+  function dropPhoto(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault()
+    setPhotoOver(false)
+    if (photoBusy || readingRef.current?.pages.some((item) => item.scene?.status === "rendering")) return
+    takePhotoFile(event.dataTransfer.files[0])
   }
 
   async function sendPhoto(file: File) {
+    if (!providerKeysReady("photo")) {
+      openKeyDialog({ kind: "photo", file }, null)
+      return
+    }
     setPhotoBusy(true)
+    let kept = false
     try {
       const body = new FormData()
       body.append("image", file)
@@ -285,11 +464,19 @@ export default function ReadingScreen() {
         response = await fetch("/api/transcribe", {
           method: "POST",
           credentials: "same-origin",
+          headers: geminiHeaders(),
           body,
         })
       } catch {
         setPhotoMessage("Transcription is unavailable.")
         return
+      }
+      if (response.status === 401) {
+        const error = await readErrorCode(response)
+        if (error === "rejected_api_key") {
+          rejectKeys(typeof keysRef.current.gemini === "object", { kind: "photo", file })
+          return
+        }
       }
       if (response.status === 400) {
         setPhotoMessage("Choose a JPEG, PNG, or WebP photo under 8 MB.")
@@ -320,18 +507,20 @@ export default function ReadingScreen() {
       }
       if (!canSaveRef.current) return
       const current = readingRef.current
-      if ((current?.pages.length ?? 0) >= 8) {
-        setPhotoMessage("This reading already has 8 pages.")
+      if (current?.pages.some((page) => page.scene?.status === "rendering")) {
+        setPhotoMessage("An illustration is still running.")
         return
       }
+      const existing = current?.pages[0]
+      if (existing) stopPolling(existing.id)
       const page: Page = {
-        id: crypto.randomUUID(),
+        id: existing?.id ?? crypto.randomUUID(),
         text: payload.text,
         photo: file,
         scene: null,
       }
       const next: Reading = current
-        ? { ...current, pages: [...current.pages, page] }
+        ? { ...current, pages: [page] }
         : {
             id: crypto.randomUUID(),
             createdAt: Date.now(),
@@ -341,38 +530,14 @@ export default function ReadingScreen() {
             pages: [page],
           }
       persist(next)
+      kept = true
+      setChosenPhoto(null)
+      setPaste("")
+      setPasteError(payload.text.trim().length > MAX_EXCERPT ? "That excerpt is too long." : null)
     } finally {
       setPhotoBusy(false)
+      if (!kept && pendingActionRef.current?.kind !== "photo") setChosenPhoto(null)
     }
-  }
-
-  function addPages() {
-    if (!canSaveRef.current) return
-    const result = splitPaste(paste)
-    if (!result.ok) {
-      setPasteError(pasteFailure(result.reason))
-      return
-    }
-    const current = readingRef.current
-    const currentCount = current?.pages.length ?? 0
-    if (currentCount + result.pages.length > 8) {
-      setPasteError("That excerpt is too long.")
-      return
-    }
-    const added = result.pages.map((text) => blankPage(text))
-    const next: Reading = current
-      ? { ...current, pages: [...current.pages, ...added] }
-      : {
-          id: crypto.randomUUID(),
-          createdAt: Date.now(),
-          hasConfirmedBudget: false,
-          budgetRemaining: 0,
-          restoredProjectIds: [],
-          pages: added,
-        }
-    if (!persist(next)) return
-    setPaste("")
-    setPasteError(null)
   }
 
   function changePageText(pageId: string, text: string) {
@@ -384,63 +549,45 @@ export default function ReadingScreen() {
     })
   }
 
-  function movePage(index: number, direction: -1 | 1) {
-    const current = readingRef.current
-    if (!current || !canSaveRef.current) return
-    const target = index + direction
-    if (target < 0 || target >= current.pages.length) return
-    const pages = current.pages.slice()
-    const [page] = pages.splice(index, 1)
-    if (!page) return
-    pages.splice(target, 0, page)
-    persist({ ...current, pages })
+  function editExcerpt(value: string) {
+    setPasteError(null)
+    const existing = readingRef.current?.pages[0]
+    if (!existing) {
+      setPaste(value)
+      return
+    }
+    changePageText(existing.id, value)
   }
 
-  function joinWithNext(index: number) {
+  function submitExcerpt() {
+    if (!canSaveRef.current || postingRef.current) return
     const current = readingRef.current
-    if (!current || !canSaveRef.current) return
-    const page = current.pages[index]
-    const next = current.pages[index + 1]
-    if (!page || !next) return
-    const result = joinPages(page.text, next.text)
-    if (!result.ok) return
-    const pages = current.pages.slice()
-    pages[index] = { ...page, text: result.text }
-    pages.splice(index + 1, 1)
-    persist({ ...current, pages })
-  }
-
-  function splitAtCaret(index: number) {
-    const current = readingRef.current
-    if (!current || !canSaveRef.current) return
-    if (current.pages.length >= 8) return
-    const page = current.pages[index]
-    if (!page) return
-    const caret = carets[page.id]
-    if (!caret || caret.start !== caret.end) return
-    const result = splitPageAt(page.text, caret.start)
-    if (!result.ok) return
-    const pages = current.pages.slice()
-    pages[index] = { ...page, text: result.left }
-    pages.splice(index + 1, 0, blankPage(result.right))
-    persist({ ...current, pages })
-  }
-
-  function confirmBudget() {
-    const current = readingRef.current
-    if (!current || !canSaveRef.current || quota.status !== "ready") return
-    const count = parseSceneCount(sceneCount)
-    const cap = maxConfirmable({
-      isFirstConfirmation: !current.hasConfirmedBudget,
-      pagesWithoutScene: current.pages.filter((page) => page.scene === null).length,
-      sceneCreatesRemaining: quota.sceneCreatesRemaining,
-    })
-    if (count === null || count < 1 || count > cap) return
-    persist({
-      ...current,
-      hasConfirmedBudget: true,
-      budgetRemaining: nextBudget(current.budgetRemaining, count, !current.hasConfirmedBudget),
-    })
+    if (current?.pages.some((page) => page.scene?.status === "rendering")) return
+    const text = (current?.pages[0]?.text ?? paste).trim()
+    if (text.length === 0) {
+      setPasteError("That excerpt is empty.")
+      return
+    }
+    if (text.length > MAX_EXCERPT) {
+      setPasteError("That excerpt is too long.")
+      return
+    }
+    setPasteError(null)
+    const existing = current?.pages[0]
+    const page: Page = existing ? { ...existing, text } : blankPage(text)
+    const next: Reading = current
+      ? { ...current, pages: [page] }
+      : {
+          id: crypto.randomUUID(),
+          createdAt: Date.now(),
+          hasConfirmedBudget: false,
+          budgetRemaining: 0,
+          restoredProjectIds: [],
+          pages: [page],
+        }
+    if (!persist(next)) return
+    setPaste("")
+    illustratePage(page.id)
   }
 
   function startOver() {
@@ -451,9 +598,11 @@ export default function ReadingScreen() {
     attemptKeys.current = {}
     postingRef.current = false
     setIllustrateBusy(false)
+    setWorkPhase(null)
     setPageNotes({})
     setAwaitingCheck({})
     setOnPageId(null)
+    setChosenPhoto(null)
     canSaveRef.current = false
     saveChainRef.current = saveChainRef.current
       .catch(() => undefined)
@@ -465,8 +614,6 @@ export default function ReadingScreen() {
         setPaste("")
         setPasteError(null)
         setPhotoMessage(null)
-        setSceneCount("")
-        setCarets({})
       })
       .catch(() => {
         canSaveRef.current = true
@@ -515,13 +662,6 @@ export default function ReadingScreen() {
     const key = crypto.randomUUID()
     attemptKeys.current[pageId] = { key, replacingProjectId: null }
     return key
-  }
-
-  function focusBudget() {
-    const input = budgetCountRef.current
-    if (!input) return
-    input.scrollIntoView({ block: "center" })
-    input.focus()
   }
 
   async function readErrorCode(response: Response): Promise<string | null> {
@@ -575,7 +715,6 @@ export default function ReadingScreen() {
     if (!page?.scene || page.scene.projectId !== projectId) return
     persist({
       ...latest,
-      budgetRemaining: latest.budgetRemaining + 1,
       restoredProjectIds: [...latest.restoredProjectIds, projectId],
       pages: latest.pages.map((item) => (item.id === pageId ? { ...item, scene: null } : item)),
     })
@@ -606,6 +745,12 @@ export default function ReadingScreen() {
     if (page.scene.status !== "rendering" && page.scene.status !== "download_failed") {
       return "settled"
     }
+    if (keysRef.current.magicHour === null) {
+      if (!keysDismissedRef.current && !dialogOpenRef.current) {
+        openKeyDialog({ kind: "poll", pageId, projectId }, null)
+      }
+      return "rendering"
+    }
     if (pollBusy.current[pageId]) return "rendering"
     pollBusy.current[pageId] = true
     try {
@@ -614,11 +759,27 @@ export default function ReadingScreen() {
         response = await fetch(`/api/scenes/${encodeURIComponent(projectId)}`, {
           credentials: "same-origin",
           cache: "no-store",
+          headers: magicHeaders(),
         })
       } catch {
         return "rendering"
       }
       if (readingEpoch.current !== epoch) return "settled"
+
+      if (response.status === 400 || response.status === 401) {
+        const error = await readErrorCode(response)
+        if (readingEpoch.current !== epoch) return "settled"
+        if (error === "rejected_api_key") {
+          rejectMagicHour({ kind: "poll", pageId, projectId })
+          return "rendering"
+        }
+        if (error === "missing_api_key") {
+          if (!dialogOpenRef.current) {
+            openKeyDialog({ kind: "poll", pageId, projectId }, null)
+          }
+          return "rendering"
+        }
+      }
 
       if (response.status === 502) {
         const error = await readErrorCode(response)
@@ -717,7 +878,17 @@ export default function ReadingScreen() {
     if (status === 429) {
       return error === "busy" ? "Another illustration is still running." : "The illustration limit is full."
     }
-    if (status === 502) return "Couldn't start the scene."
+    if (status === 502) {
+      if (error === "magic_hour") return "Magic Hour didn't start the image."
+      if (error === "gemini_400") return "Gemini refused that page."
+      if (error === "gemini_402") return "Gemini is out of credits."
+      if (error === "gemini_404") return "Gemini doesn't offer that model for this key."
+      if (error === "gemini_429") return "Gemini's rate limit is full."
+      if (error === "gemini_busy") return "Gemini is busy. Try again in a moment."
+      if (error === "gemini_parse") return "Gemini's reply could not be read."
+      if (error === "gemini_unavailable") return "Gemini didn't answer."
+      return "Couldn't start the scene."
+    }
     return "Illustration is unavailable."
   }
 
@@ -733,6 +904,8 @@ export default function ReadingScreen() {
         headers: {
           "Content-Type": "application/json",
           "Idempotency-Key": key,
+          ...geminiHeaders(),
+          ...magicHeaders(),
         },
         body: JSON.stringify({ pageText }),
       })
@@ -742,6 +915,19 @@ export default function ReadingScreen() {
       return
     }
     if (readingEpoch.current !== epoch) return
+
+    if (response.status === 401) {
+      const error = await readErrorCode(response)
+      if (readingEpoch.current !== epoch) return
+      if (error === "rejected_api_key") {
+        if (keysRef.current.gemini === "unset") {
+          rejectMagicHour({ kind: "scene", pageId })
+          return
+        }
+        rejectKeys(typeof keysRef.current.gemini === "object", { kind: "scene", pageId })
+        return
+      }
+    }
 
     if (!response.ok) {
       const error = response.status === 429 || response.status === 502 ? await readErrorCode(response) : null
@@ -776,7 +962,6 @@ export default function ReadingScreen() {
     if (page.scene?.projectId === payload.projectId && page.scene.status === "complete" && page.scene.image) {
       return
     }
-    const sameProject = page.scene?.projectId === payload.projectId
     const scene: Scene = {
       projectId: payload.projectId,
       moment: payload.moment,
@@ -788,7 +973,6 @@ export default function ReadingScreen() {
     }
     const saved = persist({
       ...latest,
-      budgetRemaining: sameProject ? latest.budgetRemaining : Math.max(0, latest.budgetRemaining - 1),
       pages: latest.pages.map((item) => (item.id === pageId ? { ...item, scene } : item)),
     })
     if (!saved) return
@@ -804,204 +988,331 @@ export default function ReadingScreen() {
 
     const replacing = page.scene?.status === "complete"
     if (replacing && !window.confirm("Replace this scene?")) return
-    if (!current.hasConfirmedBudget || current.budgetRemaining === 0) {
-      setPageNotes((notes) => ({ ...notes, [pageId]: "Confirm a scene budget first." }))
-      focusBudget()
+    if (!providerKeysReady("scene")) {
+      openKeyDialog({ kind: "scene", pageId }, null)
       return
+    }
+
+    const direct = keysRef.current.gemini === "unset"
+    if (direct) {
+      const prepared = directScenePrompt(page.text)
+      if (!prepared.ok) {
+        setPageNotes((notes) => ({ ...notes, [pageId]: prepared.reason }))
+        return
+      }
     }
 
     const key = keyForPost(pageId, page.scene, replacing)
     postingRef.current = true
     setIllustrateBusy(true)
+    setWorkPhase(direct ? "sending" : "writing")
     void requestScene(pageId, page.text, key).finally(() => {
       postingRef.current = false
       setIllustrateBusy(false)
+      setWorkPhase(null)
     })
   }
 
   pollingApi.current = { start: startPolling, stopAll: stopAllPolling }
 
-  const enteredCount = parseSceneCount(sceneCount)
-  const sceneCreatesRemaining = quota.status === "ready" ? quota.sceneCreatesRemaining : null
-  const confirmCap =
-    reading && sceneCreatesRemaining !== null
-      ? maxConfirmable({
-          isFirstConfirmation: !reading.hasConfirmedBudget,
-          pagesWithoutScene: reading.pages.filter((page) => page.scene === null).length,
-          sceneCreatesRemaining,
-        })
-      : 0
-  const confirmDisabled =
-    sceneCreatesRemaining === null || enteredCount === null || enteredCount < 1 || enteredCount > confirmCap
-  const illustrationRunning = reading?.pages.some((page) => page.scene?.status === "rendering") ?? false
+  const page = reading?.pages[0] ?? null
+  const excerpt = page?.text ?? paste
+  const shownPhoto = page?.photo ?? chosenPhoto
+  const writing = excerpt.trim().length > 0
+  const illustrationRunning = page?.scene?.status === "rendering"
+  const sceneImage = page?.scene?.status === "complete" && page.scene.image ? page.scene.image : null
+  const illustrating = page?.scene?.status === "rendering" && !awaitingCheck[page.id]
+  const stillWorking = page ? awaitingCheck[page.id] === true : false
+  const activity =
+    workPhase === "writing"
+      ? "Generating the scene prompt…"
+      : workPhase === "sending"
+        ? "Generating your picture with Magic Hour…"
+        : illustrating
+          ? "The picture is being drawn…"
+          : null
+  const visionCaption = sceneImage
+    ? page?.scene?.simulated
+      ? "Simulated scene"
+      : null
+    : activity
+      ? activity
+      : page?.scene?.status === "download_failed"
+        ? "The scene could not be downloaded."
+        : stillWorking
+          ? "Still working"
+          : "Your vision will be revealed here"
+  const illustrateLabel = workPhase ? "Generating…" : illustrating ? "Illustrating" : "Illustrate"
+  const liveStatus = activity ?? (stillWorking ? "Still working. Check again when you want." : null)
+  const keyHint = geminiHint({
+    purpose: keyAsk === "photo" ? "photo" : "scene",
+    requireTypedGemini,
+    serverHasGemini,
+  })
 
   return (
-    <div className="reading-screen">
-      <h1>Picta</h1>
-      {phase === "loading" ? <main>Loading…</main> : null}
-      {phase === "error" ? <main>The reading could not be loaded.</main> : null}
+    <div className="app-shell" onMouseMove={followLight}>
+      <div className="ambient-glow ambient-glow--one" />
+      <div className="ambient-glow ambient-glow--two" />
+
+      <header className="masthead">
+        <div className="brand">
+          <span className="brand__flourish" aria-hidden="true">
+            ◆
+          </span>
+          <h1>PICTA</h1>
+          <span className="brand__flourish" aria-hidden="true">
+            ◆
+          </span>
+        </div>
+
+        <div className="keys" aria-label="API keys">
+          <KeyField
+            id="magic-hour-key"
+            label="Magic Hour API key"
+            value={magicHourDraft}
+            onChange={setMagicHourDraft}
+          />
+          <KeyField
+            id="gemini-key"
+            label="Gemini API key"
+            value={geminiDraft}
+            onChange={setGeminiDraft}
+          />
+        </div>
+        <p className="privacy-note">Your keys remain in this browser session.</p>
+        {keyConfigLoading ? null : <p className="key-hint">{keyHint}</p>}
+      </header>
+
+      {phase === "loading" ? (
+        <main className="screen-state">
+          <p className="brand__eyebrow">Opening</p>
+          <p>Loading…</p>
+        </main>
+      ) : null}
+      {phase === "error" ? (
+        <main className="screen-state">
+          <p className="brand__eyebrow">Could not open</p>
+          <p>The reading could not be loaded.</p>
+        </main>
+      ) : null}
+
       {phase === "ready" ? (
-        <main>
-          <div className="reading-paste">
-            <textarea
-              className="paste-box"
-              value={paste}
-              aria-label="Excerpt"
-              onChange={(event) => setPaste(event.target.value)}
-            />
-            {pasteError ? <p className="reading-message">{pasteError}</p> : null}
-            <div className="action-row">
-              <button type="button" onClick={addPages}>
-                Add pages
-              </button>
-            </div>
-          </div>
-
-          <div className="reading-paste">
-            <input
-              className="page-photo"
-              type="file"
-              accept="image/jpeg, image/png, image/webp"
-              aria-label="Add a page photo"
-              disabled={photoBusy}
-              onChange={(event) => {
-                choosePhoto(event.currentTarget)
-              }}
-            />
-            {photoMessage ? <p className="reading-message">{photoMessage}</p> : null}
-          </div>
-
-          {reading && reading.pages.length > 0 ? (
-            <div className="page-stack">
-              {reading.pages.map((page, index) => {
-                const next = reading.pages[index + 1]
-                const joined = next ? joinPages(page.text, next.text) : null
-                const caret = carets[page.id]
-                const collapsed = caret !== undefined && caret.start === caret.end
-                const split = collapsed ? splitPageAt(page.text, caret.start) : null
-                const showJoin = joined?.ok === true
-                const showSplit = reading.pages.length < 8 && split?.ok === true
-                const showIllustrate =
-                  page.scene === null ||
-                  page.scene.status === "complete" ||
-                  page.scene.status === "download_failed"
-                const sceneImage =
-                  page.scene?.status === "complete" && page.scene.image ? page.scene.image : null
-                return (
-                  <article className="page-card" key={page.id}>
-                    <div className="page-body">
-                      <textarea
-                        className="page-text"
-                        value={page.text}
-                        aria-label={`Page ${index + 1}`}
-                        onChange={(event) => changePageText(page.id, event.target.value)}
-                        onSelect={(event) => rememberCaret(page.id, event.currentTarget)}
-                        onKeyUp={(event) => rememberCaret(page.id, event.currentTarget)}
-                        onClick={(event) => rememberCaret(page.id, event.currentTarget)}
-                      />
-                      {sceneImage ? (
-                        <SceneImage image={sceneImage} simulated={page.scene?.simulated === true} />
-                      ) : null}
-                      {onPageId === page.id && page.photo && sceneImage ? (
-                        <div className="on-page-overlay">
-                          <OnPageView
-                            photo={page.photo}
-                            scene={sceneImage}
-                            onClose={() => setOnPageId(null)}
+        <>
+          <section className="book-stage" aria-label="Picta prompt book">
+            <div className="book-shadow" />
+            <div className="book">
+              <div className="book__cover">
+                <div className="book__gilt-frame" />
+                <div className="book__pages">
+                  <section className="page page--left">
+                    <PageCorners side="left" />
+                    <div
+                      className={
+                        shownPhoto ? "page-compose is-photo" : writing ? "page-compose is-writing" : "page-compose"
+                      }
+                    >
+                      {shownPhoto ? null : (
+                        <>
+                          <label htmlFor="prompt" className="sr-only">
+                            Excerpt
+                          </label>
+                          <textarea
+                            id="prompt"
+                            value={excerpt}
+                            aria-label="Excerpt"
+                            placeholder="Describe the scene you wish to see…"
+                            onChange={(event) => editExcerpt(event.target.value)}
                           />
-                        </div>
-                      ) : null}
+                        </>
+                      )}
+                      {writing && !shownPhoto ? null : (
+                        <label
+                          className={
+                            photoOver || photoBusy ? "photo-well is-over" : "photo-well"
+                          }
+                          onDragEnter={(event) => {
+                            event.preventDefault()
+                            setPhotoOver(true)
+                          }}
+                          onDragOver={(event) => {
+                            event.preventDefault()
+                            setPhotoOver(true)
+                          }}
+                          onDragLeave={(event) => {
+                            const next = event.relatedTarget
+                            if (next instanceof Node && event.currentTarget.contains(next)) return
+                            setPhotoOver(false)
+                          }}
+                          onDrop={dropPhoto}
+                        >
+                          <input
+                            className="page-photo"
+                            type="file"
+                            accept="image/jpeg, image/png, image/webp"
+                            aria-label="Add a page photo"
+                            disabled={photoBusy || illustrationRunning === true}
+                            onChange={(event) => {
+                              choosePhoto(event.currentTarget)
+                            }}
+                          />
+                          {shownPhoto ? <PhotoPreview image={shownPhoto} /> : null}
+                          <span className="photo-well__title">
+                            {photoBusy ? "Reading the photo…" : shownPhoto ? "Page photo" : "Drop a page photo"}
+                          </span>
+                          <span className="photo-well__hint">
+                            {shownPhoto ? "Drop another, or click to replace" : "or click to upload"}
+                          </span>
+                        </label>
+                      )}
                     </div>
-                    {page.scene?.status === "rendering" && !awaitingCheck[page.id] ? (
-                      <p className="reading-message">Illustrating…</p>
-                    ) : null}
-                    {page.scene?.status === "download_failed" ? (
+                    {pasteError ? <p className="reading-message">{pasteError}</p> : null}
+                    {page && pageNotes[page.id] ? <p className="reading-message">{pageNotes[page.id]}</p> : null}
+                    {photoMessage ? <p className="reading-message">{photoMessage}</p> : null}
+                    {shownPhoto ? null : (
+                      <p
+                        className={excerpt.length > MAX_DIRECT_PROMPT ? "page-count is-over" : "page-count"}
+                        aria-label={`${excerpt.length} of ${MAX_DIRECT_PROMPT} characters`}
+                      >
+                        {excerpt.length}/{MAX_DIRECT_PROMPT}
+                      </p>
+                    )}
+                    <p className="page__number">I</p>
+                  </section>
+
+                  <div className="book__spine" aria-hidden="true">
+                    <span />
+                  </div>
+
+                  <section className="page page--right">
+                    <PageCorners side="right" />
+                    <div
+                      className={activity ? "mystery-frame is-working" : "mystery-frame"}
+                      aria-label={sceneImage ? "Scene" : "Generated image will appear here"}
+                    >
+                      {sceneImage ? (
+                        <SceneImage image={sceneImage} simulated={page?.scene?.simulated === true} />
+                      ) : (
+                        <FrameOrnaments />
+                      )}
+                      {sceneImage ? null : (
+                        <div className="question-mark" aria-hidden="true">
+                          ?
+                        </div>
+                      )}
+                      {sceneImage ? null : <p>{visionCaption}</p>}
+                    </div>
+                    {sceneImage && visionCaption ? <p className="page-footnote">{visionCaption}</p> : null}
+                    {page?.scene?.status === "download_failed" ? (
                       <p className="reading-message">The scene could not be downloaded.</p>
                     ) : null}
-                    {pageNotes[page.id] ? <p className="reading-message">{pageNotes[page.id]}</p> : null}
-                    <div className="action-row">
-                      <button type="button" onClick={() => movePage(index, -1)} disabled={index === 0}>
-                        Move earlier
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => movePage(index, 1)}
-                        disabled={index === reading.pages.length - 1}
-                      >
-                        Move later
-                      </button>
-                      {showJoin ? (
-                        <button type="button" onClick={() => joinWithNext(index)}>
-                          Join with next
-                        </button>
-                      ) : null}
-                      {showSplit ? (
-                        <button type="button" onClick={() => splitAtCaret(index)}>
-                          Split
-                        </button>
-                      ) : null}
-                      {showIllustrate ? (
-                        <button
-                          type="button"
-                          onClick={() => illustratePage(page.id)}
-                          disabled={illustrationRunning || illustrateBusy}
-                        >
-                          Illustrate
-                        </button>
-                      ) : null}
-                      {page.photo && sceneImage ? (
-                        <button type="button" onClick={() => setOnPageId(page.id)}>
-                          See it on the page
-                        </button>
-                      ) : null}
-                      {page.scene?.status === "download_failed" ||
-                      (page.scene?.status === "rendering" && awaitingCheck[page.id]) ? (
-                        <button type="button" onClick={() => void checkAgain(page.id)}>
-                          Check again
-                        </button>
-                      ) : null}
-                    </div>
-                  </article>
-                )
-              })}
-            </div>
-          ) : null}
-
-          {reading && reading.pages.length > 0 ? (
-            <section className="budget">
-              <p>Remaining budget: {reading.budgetRemaining}</p>
-              {quota.status === "error" ? <p>The limit could not be loaded.</p> : null}
-              {quota.status === "ready" &&
-              quota.sceneCreatesRemaining === 0 &&
-              quota.sceneWindowResetsAt > 0 ? (
-                <p>The scene limit resets at {new Date(quota.sceneWindowResetsAt).toLocaleString()}.</p>
-              ) : null}
-              <input
-                ref={budgetCountRef}
-                className="budget-count"
-                type="number"
-                step={1}
-                value={sceneCount}
-                aria-label="Scene count"
-                onChange={(event) => setSceneCount(event.target.value)}
-              />
-              <p>About {estimateCredits(enteredCount ?? 0)} credits</p>
-              <div className="action-row">
-                <button type="button" onClick={confirmBudget} disabled={confirmDisabled}>
-                  Confirm
-                </button>
+                    {page?.photo && sceneImage ||
+                    (page &&
+                      (page.scene?.status === "download_failed" ||
+                        (page.scene?.status === "rendering" && stillWorking))) ? (
+                      <div className="page-actions">
+                        {page?.photo && sceneImage ? (
+                          <button type="button" className="light-capsule" onClick={() => setOnPageId(page.id)}>
+                            See it on the page
+                          </button>
+                        ) : null}
+                        {page &&
+                        (page.scene?.status === "download_failed" ||
+                          (page.scene?.status === "rendering" && stillWorking)) ? (
+                          <button type="button" className="light-capsule" onClick={() => void checkAgain(page.id)}>
+                            Check again
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {page && onPageId === page.id && page.photo && sceneImage ? (
+                      <div className="on-page-overlay">
+                        <OnPageView photo={page.photo} scene={sceneImage} onClose={() => setOnPageId(null)} />
+                      </div>
+                    ) : null}
+                    <p className="page__number">II</p>
+                  </section>
+                </div>
               </div>
-            </section>
-          ) : null}
+              <div className="book__ribbon" aria-hidden="true" />
+            </div>
+          </section>
+
+          <div className="beneath">
+            <button
+              type="button"
+              className="illustrate light-capsule"
+              onClick={submitExcerpt}
+              disabled={illustrationRunning === true || illustrateBusy}
+              aria-busy={illustrationRunning === true || illustrateBusy}
+            >
+              {illustrateLabel}
+            </button>
+            {liveStatus ? (
+              <p className="work-status" role="status" aria-live="polite">
+                {liveStatus}
+              </p>
+            ) : null}
+          </div>
 
           {reading ? (
             <div className="start-over">
-              <button type="button" onClick={startOver}>
+              <button type="button" className="quiet" onClick={startOver}>
                 Start over
               </button>
             </div>
           ) : null}
-        </main>
+        </>
+      ) : null}
+
+      {keyDialogOpen ? (
+        <div className="key-dialog-backdrop">
+          <form
+            className="key-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="key-dialog-title"
+            onSubmit={submitKeys}
+          >
+            <h2 id="key-dialog-title">API keys</h2>
+            <p className="privacy-note">Kept in this tab until you refresh.</p>
+            {keyMessage ? <p className="key-dialog-message">{keyMessage}</p> : null}
+            {keyConfigLoading ? null : <p className="key-hint">{keyHint}</p>}
+            <KeyField
+              id="dialog-gemini-key"
+              label="Gemini API key"
+              value={geminiDraft}
+              onChange={setGeminiDraft}
+            />
+            <KeyField
+              id="dialog-magic-hour-key"
+              label="Magic Hour API key"
+              value={magicHourDraft}
+              onChange={setMagicHourDraft}
+            />
+            <div className="key-dialog-actions">
+              <button type="button" className="quiet" onClick={cancelKeys}>
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="light-capsule"
+                disabled={
+                  keyConfigLoading ||
+                  !canSubmitKeys({
+                    geminiDraft,
+                    magicHourDraft,
+                    geminiConfigured: serverHasGemini,
+                    requireTypedGemini,
+                    geminiRequired: keyAsk === "photo",
+                  })
+                }
+              >
+                Continue
+              </button>
+            </div>
+          </form>
+        </div>
       ) : null}
     </div>
   )
