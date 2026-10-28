@@ -1,3 +1,5 @@
+import { RejectedApiKeyError } from "./rejected-api-key"
+
 export type MagicHourClient = {
   create(prompt: string): Promise<{ projectId: string; creditsCharged: number }>
   get(projectId: string): Promise<
@@ -138,6 +140,9 @@ export function createLiveMagicHourClient(
         }),
       })
 
+      if (response.status === 401 || response.status === 403) {
+        throw new RejectedApiKeyError()
+      }
       if (response.status === 402) {
         throw new InsufficientCreditsError()
       }
@@ -165,6 +170,9 @@ export function createLiveMagicHourClient(
           headers: { Authorization: authorization },
         },
       )
+      if (response.status === 401 || response.status === 403) {
+        throw new RejectedApiKeyError()
+      }
       if (!response.ok) {
         throw new Error("magic_hour_status_failed")
       }

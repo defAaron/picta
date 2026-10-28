@@ -3,6 +3,7 @@ import {
   createLiveMagicHourClient,
   InsufficientCreditsError,
 } from "./magic-hour"
+import { RejectedApiKeyError } from "./rejected-api-key"
 
 const API_KEY = "test-key"
 const LIVE_ORIGIN = `https://${["api", "magichour", "ai"].join(".")}`
@@ -78,6 +79,18 @@ describe("createLiveMagicHourClient", () => {
       resolution: "640px",
       style: { prompt, tool: "general" },
     })
+  })
+
+  it("rejects a 401 without including the response body", async () => {
+    const { client } = clientWith(() => new Response("secret-body", { status: 401 }))
+    const error = await client.create("A red kite over a field.").then(
+      () => {
+        throw new Error("expected rejection")
+      },
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(RejectedApiKeyError)
+    expect(error).toMatchObject({ message: "rejected_api_key" })
   })
 
   it("throws InsufficientCreditsError on 402 and does not fetch again", async () => {
