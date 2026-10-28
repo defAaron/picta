@@ -15,14 +15,14 @@ Every problem inherits these. Do not pick different numbers.
 - Maximum 8 pages in one reading. A paste over 20,000 characters is refused. A page from a join is at most 5,000 characters. Automatic splits target 2,500 characters and break on a blank line. A line that is only `---` is a page break.
 - One confirmed scene costs an estimate of 5 credits. The first confirmation sets `budgetRemaining`. A later confirmation adds to it. Confirmation does not call Magic Hour.
 - `hasConfirmedBudget` is false until the first confirmation. Spent-to-zero is not the same as never confirmed.
-- Gemini model id `gemini-2.5-flash`, `thinkingBudget` 0, grounding off, tools off.
+- Gemini model id `gemini-3.8-flash`, `thinkingLevel` `low`, grounding off, tools off.
 - Magic Hour: `model` `z-image-turbo`, `image_count` 1, `resolution` `640px`, `aspect_ratio` `1:1`, `style.tool` `general`. The image prompt is the model’s `imagePrompt`, 1–500 characters, never the raw page.
 - Session scene cap 8 per 24 hours. IP scene cap 20 per 24 hours. Session Gemini cap 20 per hour. IP Gemini cap 60 per hour. One in-flight scene per session, released on acknowledge, render error, or after 5 minutes.
 - Cookie name `picta_sid`. HttpOnly, SameSite=Lax, Secure only on HTTPS, 30 days.
 - Ignore `X-Forwarded-For` unless `TRUSTED_PROXY=true`.
 - Photos: `image/jpeg`, `image/png`, `image/webp`, maximum 8 MB, transcribed one at a time.
 - Server stores no page text and no photo. The in-flight row may hold the scene prompt until that job ends.
-- Keys live in server env vars only: `GEMINI_API_KEY`, `MAGIC_HOUR_API_KEY`.
+- A typed Gemini key is sent as `X-Picta-Gemini-Key`. A blank Gemini key uses `GEMINI_API_KEY`. Magic Hour uses only `X-Picta-Magic-Hour-Key`. Keys stay in tab memory and are not stored.
 - No accounts. One reading in IndexedDB database `picta`.
 - On-page frame: centered, inset 8% from each side, lower 42% of the photo height, soft shadow. No perspective warp.
 - Poll every 2 seconds. Stop the timer after 3 minutes and offer “Check again.”
