@@ -36,10 +36,15 @@ function fakeClient(result: unknown): { client: GeminiClient; calls: RecordedCal
   }
 }
 
-function upload(type: string, sessionId?: string, bytes: Uint8Array = new Uint8Array([1, 2, 3])): Request {
+function upload(
+  type: string,
+  sessionId?: string,
+  bytes: Uint8Array = new Uint8Array([1, 2, 3]),
+  extra?: HeadersInit,
+): Request {
   const form = new FormData()
   form.append("image", new File([bytes], "page.bin", { type }))
-  const headers = new Headers()
+  const headers = new Headers(extra)
   if (sessionId !== undefined) headers.set("cookie", `picta_sid=${sessionId}`)
   return new Request("http://localhost/api/transcribe", {
     method: "POST",
@@ -204,18 +209,49 @@ describe("POST /api/transcribe", () => {
     }
   })
 
-  it("returns 502 without calling fetch when the api key is unset and no client is passed", async () => {
+  it("returns 400 without calling fetch when no Gemini key is available", async () => {
     delete process.env.GEMINI_API_KEY
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("no", { status: 500 }))
     try {
-      const response = await POST(upload("image/png"))
-      expect(response.status).toBe(502)
-      expect(await response.json()).toEqual({ error: "transcribe_unavailable" })
+      const id = randomBytes(32).toString("hex")
+      const response = await POST(upload("image/png", id))
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({ error: "missing_api_key" })
       expect(fetchSpy).not.toHaveBeenCalled()
+      const bucket = sessionBucket(id)
+      expect(remainingWindow(limitsForTests(), bucket, Date.now(), HOUR_MS, SESSION_CAP).remaining).toBe(
+        SESSION_CAP,
+      )
     } finally {
       fetchSpy.mockRestore()
       if (originalKey === undefined) delete process.env.GEMINI_API_KEY
       else process.env.GEMINI_API_KEY = originalKey
+    }
+  })
+
+  it("sends the typed Gemini key and does not fall through from an oversized key", async () => {
+    process.env.GEMINI_API_KEY = "env-key"
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 401 }))
+    try {
+      const typed = await POST(upload("image/png", undefined, new Uint8Array([1]), {
+        "x-picta-gemini-key": "typed-key",
+      }))
+      const typedBody = await typed.json()
+      expect(typed.status).toBe(401)
+      expect(typedBody).toEqual({ error: "rejected_api_key" })
+      expect(JSON.stringify(typedBody)).not.toContain("typed-key")
+      const headers = new Headers(fetchSpy.mock.calls[0]?.[1]?.headers)
+      expect(headers.get("x-goog-api-key")).toBe("typed-key")
+
+      fetchSpy.mockClear()
+      const oversized = await POST(upload("image/png", undefined, new Uint8Array([1]), {
+        "x-picta-gemini-key": "g".repeat(257),
+      }))
+      expect(oversized.status).toBe(400)
+      expect(await oversized.json()).toEqual({ error: "missing_api_key" })
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally {
+      fetchSpy.mockRestore()
     }
   })
 })

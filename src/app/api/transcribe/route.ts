@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server"
+import { resolveGeminiKey } from "../../../lib/api-keys"
 import { clientIp } from "../../../lib/client-ip"
 import { createGeminiClient, type GeminiClient } from "../../../lib/gemini"
+import { RejectedApiKeyError } from "../../../lib/rejected-api-key"
 import { openLimits, remainingWindow, takeWindow, type LimitsDb } from "../../../lib/limits"
 import { parseTranscribeResult, type TranscribeResult } from "../../../lib/transcribe-schema"
 import { attachSessionCookie, resolveSessionId } from "../session/route"
@@ -72,13 +74,6 @@ function geminiRefusal(sessionId: string, ip: string): number | null {
   return null
 }
 
-function resolveClient(client: GeminiClient | undefined): GeminiClient | null {
-  if (client !== undefined && typeof client.transcribe === "function") return client
-  const apiKey = process.env.GEMINI_API_KEY
-  if (typeof apiKey !== "string" || apiKey.length === 0) return null
-  return createGeminiClient(apiKey)
-}
-
 function outcome(result: TranscribeResult): { accepted: false; reason: string } | { accepted: true; text: string } {
   if (result.singlePage !== true) {
     return { accepted: false, reason: ONE_PAGE_REASON }
@@ -101,20 +96,27 @@ export async function POST(request: Request, client?: GeminiClient): Promise<Nex
     return respond(request, session, { error: "bad_image" }, 400)
   }
 
+  let gemini: GeminiClient
+  if (client !== undefined && typeof client.transcribe === "function") {
+    gemini = client
+  } else {
+    const resolved = resolveGeminiKey(request)
+    if (!resolved.ok) return respond(request, session, { error: "missing_api_key" }, 400)
+    gemini = createGeminiClient(resolved.apiKey)
+  }
+
   const resetsAt = geminiRefusal(session.id, clientIp(request.headers, null))
   if (resetsAt !== null) {
     return respond(request, session, { error: "rate_limited", resetsAt }, 429)
   }
 
-  const gemini = resolveClient(client)
-  if (gemini === null) {
-    return respond(request, session, { error: "transcribe_unavailable" }, 502)
-  }
-
   let raw: unknown
   try {
     raw = await gemini.transcribe(image.bytes, image.mimeType)
-  } catch {
+  } catch (error) {
+    if (error instanceof RejectedApiKeyError) {
+      return respond(request, session, { error: "rejected_api_key" }, 401)
+    }
     return respond(request, session, { error: "transcribe_unavailable" }, 502)
   }
 
