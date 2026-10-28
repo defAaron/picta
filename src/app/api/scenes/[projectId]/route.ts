@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server"
+import { resolveMagicHourKey } from "../../../../lib/api-keys"
 import { clientIp } from "../../../../lib/client-ip"
 import { clearInflight, expireInflight, readInflight, releaseScene } from "../../../../lib/limits"
 import type { MagicHourClient } from "../../../../lib/magic-hour"
+import { RejectedApiKeyError } from "../../../../lib/rejected-api-key"
 import { attachSessionCookie, resolveSessionId } from "../../session/route"
 import { getLimitsDb, resolveMagicHour } from "../shared"
 
@@ -34,7 +36,15 @@ export async function GET(
     return json(request, session, { error: "not_found" }, 404)
   }
 
-  const magicHour = resolveMagicHour(deps?.magicHour).client
+  let magicHourKey: string | undefined
+  if (deps?.magicHour === undefined) {
+    const resolved = resolveMagicHourKey(request)
+    if (!resolved.ok) return json(request, session, { error: "missing_api_key" }, 400)
+    magicHourKey = resolved.apiKey
+  }
+  const magic = resolveMagicHour(deps?.magicHour, magicHourKey)
+  if (magic === null) return json(request, session, { error: "missing_api_key" }, 400)
+  const magicHour = magic.client
   try {
     const result = await magicHour.get(projectId)
     if (result.status === "rendering") {
@@ -54,7 +64,10 @@ export async function GET(
     })
     if (session.isNew) attachSessionCookie(response, request, session.id)
     return response
-  } catch {
+  } catch (error) {
+    if (error instanceof RejectedApiKeyError) {
+      return json(request, session, { error: "rejected_api_key" }, 401)
+    }
     return json(request, session, { error: "download_failed" }, 502)
   }
 }

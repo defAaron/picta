@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server"
+import { resolveMagicHourKey, sceneGemini } from "../../../lib/api-keys"
+import { directScenePrompt } from "../../../lib/direct-scene"
 import { clientIp } from "../../../lib/client-ip"
-import { createGeminiClient, type GeminiClient } from "../../../lib/gemini"
+import { createGeminiClient, GeminiRequestError, type GeminiClient } from "../../../lib/gemini"
 import { parseIllustrateResult, type IllustrateResult } from "../../../lib/illustrate-schema"
 import {
   beginInflight,
@@ -14,6 +16,7 @@ import {
   type LimitsDb,
 } from "../../../lib/limits"
 import { InsufficientCreditsError, type MagicHourClient } from "../../../lib/magic-hour"
+import { RejectedApiKeyError } from "../../../lib/rejected-api-key"
 import { attachSessionCookie, resolveSessionId } from "../session/route"
 import { getLimitsDb, resolveMagicHour } from "./shared"
 
@@ -67,13 +70,20 @@ async function readPage(request: Request): Promise<
   return { ok: true, pageText: trimmed, idempotencyKey }
 }
 
-function blockedReset(db: LimitsDb, sid: string, ip: string, nowMs: number): number | null {
-  const checks = [
-    [`sid:${sid}:gemini`, HOUR_MS, SESSION_GEMINI_CAP],
-    [`ip:${ip}:gemini`, HOUR_MS, IP_GEMINI_CAP],
-    [`sid:${sid}:scene`, DAY_MS, SESSION_SCENE_CAP],
-    [`ip:${ip}:scene`, DAY_MS, IP_SCENE_CAP],
-  ] as const
+function blockedReset(
+  db: LimitsDb,
+  sid: string,
+  ip: string,
+  nowMs: number,
+  skipGemini = false,
+): number | null {
+  const checks: Array<readonly [string, number, number]> = []
+  if (!skipGemini) {
+    checks.push([`sid:${sid}:gemini`, HOUR_MS, SESSION_GEMINI_CAP])
+    checks.push([`ip:${ip}:gemini`, HOUR_MS, IP_GEMINI_CAP])
+  }
+  checks.push([`sid:${sid}:scene`, DAY_MS, SESSION_SCENE_CAP])
+  checks.push([`ip:${ip}:scene`, DAY_MS, IP_SCENE_CAP])
   for (const [bucket, windowMs, cap] of checks) {
     const window = remainingWindow(db, bucket, nowMs, windowMs, cap)
     if (window.remaining === 0) return window.resetsAt
@@ -102,16 +112,9 @@ function takeScene(
   return { ok: true }
 }
 
-function resolveGemini(client: GeminiClient | undefined): GeminiClient | null {
-  if (client !== undefined) return client
-  const apiKey = process.env.GEMINI_API_KEY
-  if (typeof apiKey !== "string" || apiKey.length === 0) return null
-  return createGeminiClient(apiKey)
-}
-
 function refusalReason(result: IllustrateResult, moment: string, imagePrompt: string): string | null {
   const momentOk = moment.length >= 1 && moment.length <= 200
-  const promptOk = imagePrompt.length >= 1 && imagePrompt.length <= 500
+  const promptOk = imagePrompt.length >= 1
   if (result.allowed === true && momentOk && promptOk) return null
   if (result.allowed === false) {
     const reason = result.rejectReason === null ? "" : result.rejectReason.trim()
@@ -153,12 +156,29 @@ function injectedDeps(second: SceneDeps | ScenesContext | undefined): SceneDeps 
 async function illustratePage(
   gemini: GeminiClient,
   pageText: string,
-): Promise<{ ok: true; result: IllustrateResult } | { ok: false }> {
+): Promise<{ ok: true; result: IllustrateResult } | { ok: false; code: string }> {
+  let value: unknown
   try {
-    return parseIllustrateResult(await gemini.illustrate(pageText))
-  } catch {
-    return { ok: false }
+    value = await gemini.illustrate(pageText)
+  } catch (error) {
+    if (error instanceof RejectedApiKeyError || error instanceof GeminiRequestError) throw error
+    const parse =
+      error instanceof Error &&
+      (error.message === "Gemini response missing text" || error.message === "Gemini response text was not valid JSON")
+    return { ok: false, code: parse ? "gemini_parse" : "illustrate_unavailable" }
   }
+  const parsed = parseIllustrateResult(value)
+  if (!parsed.ok) return { ok: false, code: "gemini_parse" }
+  return parsed
+}
+
+function geminiFailureCode(status: number): string {
+  if (status === 400) return "gemini_400"
+  if (status === 402) return "gemini_402"
+  if (status === 404) return "gemini_404"
+  if (status === 429) return "gemini_429"
+  if (status === 500 || status === 503) return "gemini_busy"
+  return "gemini_unavailable"
 }
 
 export async function POST(
@@ -170,6 +190,21 @@ export async function POST(
   const page = await readPage(request)
   if (!page.ok) return json(request, session, { error: "bad_page" }, 400)
 
+  let geminiKey: string | undefined
+  let direct = false
+  if (injected.gemini === undefined) {
+    const choice = sceneGemini(request)
+    if (choice.mode === "invalid") return json(request, session, { error: "missing_api_key" }, 400)
+    if (choice.mode === "direct") direct = true
+    else geminiKey = choice.apiKey
+  }
+  let magicHourKey: string | undefined
+  if (injected.magicHour === undefined) {
+    const resolved = resolveMagicHourKey(request)
+    if (!resolved.ok) return json(request, session, { error: "missing_api_key" }, 400)
+    magicHourKey = resolved.apiKey
+  }
+
   const db = getLimitsDb()
   const nowMs = Date.now()
   const ip = clientIp(request.headers, null)
@@ -178,7 +213,7 @@ export async function POST(
   const existing = readInflight(db, session.id)
   if (existing !== null && existing.idempotencyKey === page.idempotencyKey) {
     if (existing.projectId !== null) {
-      const { simulated } = resolveMagicHour(injected.magicHour)
+      const simulated = resolveMagicHour(injected.magicHour, magicHourKey)?.simulated === true
       return json(
         request,
         session,
@@ -197,9 +232,16 @@ export async function POST(
     return json(request, session, { error: "busy" }, 429)
   }
 
-  const blocked = blockedReset(db, session.id, ip, nowMs)
+  const blocked = blockedReset(db, session.id, ip, nowMs, direct)
   if (blocked !== null) {
     return json(request, session, { error: "rate_limited", resetsAt: blocked }, 429)
+  }
+
+  let directScene: { prompt: string; moment: string } | null = null
+  if (direct) {
+    const prepared = directScenePrompt(page.pageText)
+    if (!prepared.ok) return json(request, session, { allowed: false, reason: prepared.reason })
+    directScene = { prompt: prepared.prompt, moment: prepared.moment }
   }
 
   const begun = beginInflight(db, session.id, page.idempotencyKey, nowMs)
@@ -210,23 +252,40 @@ export async function POST(
     return json(request, session, { error: "busy" }, 429)
   }
 
-  const gemini = resolveGemini(injected.gemini)
-  if (gemini === null) {
-    clearInflight(db, session.id)
-    return json(request, session, { error: "illustrate_unavailable" }, 502)
+  let illustrated: IllustrateResult
+  if (directScene) {
+    illustrated = {
+      allowed: true,
+      rejectReason: null,
+      moment: directScene.moment,
+      imagePrompt: directScene.prompt,
+    }
+  } else {
+    const gemini = injected.gemini ?? createGeminiClient(geminiKey ?? "")
+    const geminiReset = takeGemini(db, session.id, ip, nowMs)
+    if (geminiReset !== null) {
+      clearInflight(db, session.id)
+      return json(request, session, { error: "rate_limited", resetsAt: geminiReset }, 429)
+    }
+    let parsed: { ok: true; result: IllustrateResult } | { ok: false; code: string }
+    try {
+      parsed = await illustratePage(gemini, page.pageText)
+    } catch (error) {
+      clearInflight(db, session.id)
+      if (error instanceof RejectedApiKeyError) {
+        return json(request, session, { error: "rejected_api_key" }, 401)
+      }
+      if (error instanceof GeminiRequestError) {
+        return json(request, session, { error: geminiFailureCode(error.status) }, 502)
+      }
+      throw error
+    }
+    if (!parsed.ok) {
+      clearInflight(db, session.id)
+      return json(request, session, { error: parsed.code }, 502)
+    }
+    illustrated = parsed.result
   }
-
-  const geminiReset = takeGemini(db, session.id, ip, nowMs)
-  if (geminiReset !== null) {
-    clearInflight(db, session.id)
-    return json(request, session, { error: "rate_limited", resetsAt: geminiReset }, 429)
-  }
-  const parsed = await illustratePage(gemini, page.pageText)
-  if (!parsed.ok) {
-    clearInflight(db, session.id)
-    return json(request, session, { error: "illustrate_unavailable" }, 502)
-  }
-  const illustrated = parsed.result
 
   const moment = illustrated.moment.trim()
   const imagePrompt = illustrated.imagePrompt.trim()
@@ -243,7 +302,13 @@ export async function POST(
     return json(request, session, { error: "rate_limited", resetsAt: scene.resetsAt }, 429)
   }
 
-  const { client: magicHour, simulated } = resolveMagicHour(injected.magicHour)
+  const magic = resolveMagicHour(injected.magicHour, magicHourKey)
+  if (magic === null) {
+    releaseScene(db, session.id, ip)
+    clearInflight(db, session.id)
+    return json(request, session, { error: "missing_api_key" }, 400)
+  }
+  const { client: magicHour, simulated } = magic
   try {
     const created = await magicHour.create(imagePrompt)
     completeInflight(db, session.id, {
@@ -260,8 +325,14 @@ export async function POST(
   } catch (error) {
     releaseScene(db, session.id, ip)
     clearInflight(db, session.id)
+    if (error instanceof RejectedApiKeyError) {
+      return json(request, session, { error: "rejected_api_key" }, 401)
+    }
     if (error instanceof InsufficientCreditsError) {
       return json(request, session, { error: "insufficient_credits" }, 402)
+    }
+    if (error instanceof Error && (error.message === "magic_hour_create_failed" || error.message === "magic_hour_request_failed")) {
+      return json(request, session, { error: "magic_hour" }, 502)
     }
     return json(request, session, { error: "illustrate_unavailable" }, 502)
   }

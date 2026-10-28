@@ -152,4 +152,17 @@ describe("GET and DELETE /api/scenes/:projectId", () => {
     expect(missing.status).toBe(200)
     expect(await missing.json()).toEqual({ ok: true })
   })
+
+  it("asks for a Magic Hour key before polling and leaves the row", async () => {
+    const sid = newSid()
+    const db = limitsForTests()
+    const magicHour = createMockMagicHourClient()
+    const projectId = await createScene(sid, magicHour)
+
+    const response = await GET(projectRequest("GET", projectId, sid), params(projectId))
+
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: "missing_api_key" })
+    expect(readInflight(db, sid)?.projectId).toBe(projectId)
+  })
 })
