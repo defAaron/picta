@@ -4,7 +4,10 @@ import Database from "better-sqlite3"
 
 export type LimitsDb = Database.Database
 
-const DEFAULT_FILENAME = path.join("data", "limits.sqlite")
+function defaultLimitsFile(): string {
+  if (process.env.VERCEL) return path.join("/tmp", "picta-limits.sqlite")
+  return path.join("data", "limits.sqlite")
+}
 
 type WindowRow = {
   count: number
@@ -60,7 +63,7 @@ type InflightSqlRow = {
 type BeginInflightResult = { ok: true } | { ok: false; reason: "in_progress" | "busy" }
 
 export function openLimits(filename?: string): LimitsDb {
-  const file = filename ?? DEFAULT_FILENAME
+  const file = filename ?? defaultLimitsFile()
   if (file !== ":memory:") {
     fs.mkdirSync(path.dirname(file), { recursive: true })
   }

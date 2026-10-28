@@ -89,7 +89,14 @@ function outcome(result: TranscribeResult): { accepted: false; reason: string } 
   return { accepted: true, text }
 }
 
-export async function POST(request: Request, client?: GeminiClient): Promise<NextResponse> {
+type TranscribeContext = {
+  params: Promise<unknown>
+}
+
+export async function POST(
+  request: Request,
+  client?: GeminiClient | TranscribeContext,
+): Promise<NextResponse> {
   const session = resolveSessionId(request)
   const image = await readImage(request)
   if (image === null) {
@@ -97,7 +104,7 @@ export async function POST(request: Request, client?: GeminiClient): Promise<Nex
   }
 
   let gemini: GeminiClient
-  if (client !== undefined && typeof client.transcribe === "function") {
+  if (client !== undefined && "transcribe" in client && typeof client.transcribe === "function") {
     gemini = client
   } else {
     const resolved = resolveGeminiKey(request)
