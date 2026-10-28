@@ -13,7 +13,8 @@ export function parseIllustrateResult(value: unknown):
   }
 
   const record = value as Record<string, unknown>
-  const { allowed, rejectReason, moment, imagePrompt } = record
+  const { allowed, moment, imagePrompt } = record
+  const rejectReason = Object.hasOwn(record, "rejectReason") ? record.rejectReason : null
   if (typeof allowed !== "boolean") return { ok: false }
   if (!(rejectReason === null || typeof rejectReason === "string")) return { ok: false }
   if (typeof moment !== "string") return { ok: false }

@@ -20,6 +20,22 @@ describe("illustrate schema", () => {
     })
   })
 
+  it("treats a missing reject reason as null", () => {
+    expect(parseIllustrateResult({
+      allowed: true,
+      moment: "A lantern in a stairwell",
+      imagePrompt: "A child holding a lantern on stone stairs",
+    })).toEqual({
+      ok: true,
+      result: {
+        allowed: true,
+        rejectReason: null,
+        moment: "A lantern in a stairwell",
+        imagePrompt: "A child holding a lantern on stone stairs",
+      },
+    })
+  })
+
   it("rejects a missing imagePrompt field", () => {
     expect(parseIllustrateResult({
       allowed: true,

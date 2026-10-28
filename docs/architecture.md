@@ -43,9 +43,9 @@ A split Python API was considered. The only pressure for a second service is Mag
 
 Serverless hosting was rejected for v1. The rate-limit counters need a durable file on one process. A serverless fan-out would need Redis, and a serverless timeout policy is a poor fit for a worker even when each poll is short. One Node process keeps the key, the counters, and the poll endpoint in the same place.
 
-### Gemini 2.5 Flash as the only model
+### Gemini 3.8 Flash as the only model
 
-The model id is `gemini-2.5-flash`.
+The model id is `gemini-3.8-flash`.
 
 It is the free model that can both read a photograph and write a scene prompt, so pasted pages and photographed pages share one safety path. Google’s pricing page lists text and image input as free of charge on the free tier, and lists a 1M-token context window. Both of Picta’s calls are far smaller than that window.
 
@@ -53,7 +53,7 @@ Groq’s free text models are faster and, by Groq’s terms, are not used for tr
 
 Cost of this choice: on the free tier, Google may use inputs to improve its products. Page text and page photos will be sent to Gemini. Do not send them anywhere else. Do not log them.
 
-Thinking is turned off (`thinkingBudget: 0`) on both calls. These calls are extraction and a short prompt, and hidden reasoning tokens would spend the shared free-tier quota without improving the scene.
+Thinking is set to `low` on both calls. These calls are extraction and a short prompt, and hidden reasoning tokens would spend the shared free-tier quota without improving the scene.
 
 Grounding and tool use are off. The model has no web access and no function calls.
 

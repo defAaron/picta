@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest"
-import { createGeminiClient } from "./gemini"
+import { createGeminiClient, GeminiRequestError } from "./gemini"
+import { RejectedApiKeyError } from "./rejected-api-key"
 
 const FAKE_KEY = "fake-key"
 
 describe("createGeminiClient", () => {
-  it("posts gemini-2.5-flash with a thinking budget of 0 and no tools", async () => {
+  it("posts gemini-3.8-flash with low thinking and no tools", async () => {
     const image = new Uint8Array([1, 2, 3])
     let capturedUrl = ""
     let capturedBody = ""
@@ -28,17 +29,18 @@ describe("createGeminiClient", () => {
     const client = createGeminiClient(FAKE_KEY, fetchImpl)
     await client.transcribe(image, "image/png")
 
-    expect(capturedUrl).toContain("gemini-2.5-flash")
+    expect(capturedUrl).toContain("gemini-3.8-flash")
     const body = JSON.parse(capturedBody) as {
       tools?: unknown
       systemInstruction: { parts: Array<{ text: string }> }
       contents: Array<{ parts: Array<{ text?: string }> }>
       generationConfig: {
         responseMimeType: string
-        thinkingConfig: { thinkingBudget: number }
+        thinkingConfig: { thinkingLevel?: string; thinkingBudget?: number }
       }
     }
-    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(0)
+    expect(body.generationConfig.thinkingConfig.thinkingLevel).toBe("low")
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBeUndefined()
     expect(body.generationConfig.responseMimeType).toBe("application/json")
     expect(JSON.stringify(body)).toContain("Transcribe this image.")
     expect(body.systemInstruction.parts[0]?.text).toBe(
@@ -64,6 +66,14 @@ describe("createGeminiClient", () => {
     await expect(client.transcribe(new Uint8Array([4]), "image/jpeg")).resolves.toEqual(transcript)
   })
 
+  it("rejects a 401 without reading the response into the error", async () => {
+    const fetchImpl: typeof fetch = async () => new Response("secret-body", { status: 401 })
+    const client = createGeminiClient(FAKE_KEY, fetchImpl)
+    await expect(client.transcribe(new Uint8Array([5]), "image/png")).rejects.toBeInstanceOf(
+      RejectedApiKeyError,
+    )
+  })
+
   it("throws when the response is not ok and calls fetch once", async () => {
     let calls = 0
     const fetchImpl: typeof fetch = async () => {
@@ -76,7 +86,7 @@ describe("createGeminiClient", () => {
     expect(calls).toBe(1)
   })
 
-  it("posts page text to gemini-2.5-flash with a thinking budget of 0 and no tools", async () => {
+  it("posts page text to gemini-3.8-flash with low thinking and no tools", async () => {
     const pageText = "The raw page stays in the user content."
     const illustrated = {
       allowed: true,
@@ -106,7 +116,7 @@ describe("createGeminiClient", () => {
     const client = createGeminiClient(FAKE_KEY, fetchImpl)
     await expect(client.illustrate(pageText)).resolves.toEqual(illustrated)
 
-    expect(capturedUrl).toContain("gemini-2.5-flash")
+    expect(capturedUrl).toContain("gemini-3.8-flash")
     expect(capturedKey).toBe(FAKE_KEY)
     const body = JSON.parse(capturedBody) as {
       tools?: unknown
@@ -114,10 +124,11 @@ describe("createGeminiClient", () => {
       contents: Array<{ role: string; parts: Array<{ text?: string }> }>
       generationConfig: {
         responseMimeType: string
-        thinkingConfig: { thinkingBudget: number }
+        thinkingConfig: { thinkingLevel?: string; thinkingBudget?: number }
       }
     }
-    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBe(0)
+    expect(body.generationConfig.thinkingConfig.thinkingLevel).toBe("low")
+    expect(body.generationConfig.thinkingConfig.thinkingBudget).toBeUndefined()
     expect(body.generationConfig.responseMimeType).toBe("application/json")
     expect(body.tools).toBeUndefined()
     expect(Object.hasOwn(body, "tools")).toBe(false)
@@ -132,6 +143,122 @@ describe("createGeminiClient", () => {
     const fetchImpl: typeof fetch = async () => new Response("unavailable", { status: 503 })
     const client = createGeminiClient(FAKE_KEY, fetchImpl)
     await expect(client.illustrate("A page")).rejects.toThrow(Error)
+  })
+
+  it("treats a 400 invalid Gemini key as a rejected key and leaves the body out of the error", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 400,
+            message: "secret-body",
+            status: "INVALID_ARGUMENT",
+            details: [{ reason: "API_KEY_INVALID" }],
+          },
+        }),
+        { status: 400 },
+      )
+    const client = createGeminiClient(FAKE_KEY, fetchImpl)
+    const error = await client.illustrate("A page").then(
+      () => {
+        throw new Error("expected rejection")
+      },
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(RejectedApiKeyError)
+    expect(error).toMatchObject({ message: "rejected_api_key" })
+    expect(String(error)).not.toContain("secret-body")
+  })
+
+  it("does not treat a non-key Gemini 400 as a rejected key", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 400,
+            status: "INVALID_ARGUMENT",
+            details: [{ reason: "INVALID_ARGUMENT" }],
+          },
+        }),
+        { status: 400 },
+      )
+    const client = createGeminiClient(FAKE_KEY, fetchImpl)
+    const error = await client.illustrate("A page").then(
+      () => {
+        throw new Error("expected rejection")
+      },
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(Error)
+    expect(error).not.toBeInstanceOf(RejectedApiKeyError)
+    expect(error).toMatchObject({ message: "Gemini request failed" })
+  })
+
+  it("reads the answer when a thought part comes first", async () => {
+    const illustrated = {
+      allowed: true,
+      rejectReason: null,
+      moment: "A corner",
+      imagePrompt: "A lantern",
+    }
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: "reasoning that is not json", thought: true },
+                { text: JSON.stringify(illustrated) },
+              ],
+            },
+          },
+        ],
+      })
+    const client = createGeminiClient(FAKE_KEY, fetchImpl)
+    await expect(client.illustrate("A page")).resolves.toEqual(illustrated)
+  })
+
+  it("uses the last JSON part when an earlier part is prose", async () => {
+    const illustrated = {
+      allowed: true,
+      rejectReason: null,
+      moment: "A corner",
+      imagePrompt: "A lantern",
+    }
+    const fetchImpl: typeof fetch = async () =>
+      jsonResponse({
+        candidates: [
+          {
+            content: {
+              parts: [
+                { text: "The page describes a corner." },
+                { text: "```json\n" + JSON.stringify(illustrated) + "\n```" },
+              ],
+            },
+          },
+        ],
+      })
+    const client = createGeminiClient(FAKE_KEY, fetchImpl)
+    await expect(client.illustrate("A page")).resolves.toEqual(illustrated)
+  })
+
+  it("returns gemini status 400 when the failure is not a rejected key", async () => {
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: { code: 400, status: "INVALID_ARGUMENT", details: [{ reason: "INVALID_ARGUMENT" }] },
+        }),
+        { status: 400 },
+      )
+    const client = createGeminiClient(FAKE_KEY, fetchImpl)
+    const error = await client.illustrate("A page").then(
+      () => {
+        throw new Error("expected rejection")
+      },
+      (caught: unknown) => caught,
+    )
+    expect(error).toBeInstanceOf(GeminiRequestError)
+    expect(error).toMatchObject({ status: 400, message: "Gemini request failed" })
   })
 })
 
