@@ -5,6 +5,7 @@ import { GET, limitsForTests, runtime } from "./route"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const originalTrustedProxy = process.env.TRUSTED_PROXY
+const originalGemini = process.env.GEMINI_API_KEY
 
 afterEach(() => {
   if (originalTrustedProxy === undefined) {
@@ -12,6 +13,8 @@ afterEach(() => {
   } else {
     process.env.TRUSTED_PROXY = originalTrustedProxy
   }
+  if (originalGemini === undefined) delete process.env.GEMINI_API_KEY
+  else process.env.GEMINI_API_KEY = originalGemini
 })
 
 function windowCount(): number {
@@ -35,6 +38,7 @@ describe("GET /api/quota", () => {
 
   it("reads the same remaining window twice without spending it", async () => {
     delete process.env.TRUSTED_PROXY
+    delete process.env.GEMINI_API_KEY
     const before = windowCount()
 
     const first = await GET(new Request("http://localhost/api/quota"))
@@ -63,6 +67,7 @@ describe("GET /api/quota", () => {
       geminiCallsRemaining: 20,
       sceneWindowResetsAt: 0,
       geminiWindowResetsAt: 0,
+      geminiConfigured: false,
     })
     expect(secondBody).toEqual(firstBody)
     expect(forwardedBody.sceneCreatesRemaining).toBe(firstBody.sceneCreatesRemaining)
@@ -121,5 +126,13 @@ describe("GET /api/quota", () => {
     const body = await response.json()
     expect(body.sceneCreatesRemaining).toBe(8)
     expect(body.geminiCallsRemaining).toBe(20)
+  })
+
+  it("reports whether a server Gemini key is configured without returning it", async () => {
+    process.env.GEMINI_API_KEY = "env-key"
+    const response = await GET(new Request("http://localhost/api/quota"))
+    const body = await response.json()
+    expect(body.geminiConfigured).toBe(true)
+    expect(JSON.stringify(body)).not.toContain("env-key")
   })
 })

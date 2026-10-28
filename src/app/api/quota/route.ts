@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server"
+import { geminiConfigured } from "../../../lib/api-keys"
 import { clientIp } from "../../../lib/client-ip"
 import { openLimits, remainingWindow, type LimitsDb } from "../../../lib/limits"
 import { attachSessionCookie, resolveSessionId } from "../session/route"
@@ -76,6 +77,7 @@ function quotaFor(sessionId: string, ip: string) {
     geminiCallsRemaining: gemini.remaining,
     sceneWindowResetsAt: scene.resetsAt,
     geminiWindowResetsAt: gemini.resetsAt,
+    geminiConfigured: geminiConfigured(),
   }
 }
 
