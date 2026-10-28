@@ -1,8 +1,8 @@
 # Handoff
 
-**Finished:** Problem 6 — Security pass
+**Finished:** Problem 6 — Security pass, then typed keys
 **Next:** none — the plan is finished
-**Do this next:** Nothing in the plan. Add `GEMINI_API_KEY` and `MAGIC_HOUR_API_KEY` to `.env.local` when you want live transcription and scenes.
+**Do this next:** Nothing in the plan. The reading screen asks for a Gemini key and a Magic Hour key the first time a photo or a scene needs them. A blank Gemini key uses `GEMINI_API_KEY`. Magic Hour uses only the typed key. Both stay in that tab until refresh.
 
 ## Read
 
@@ -12,26 +12,15 @@
 
 - docs/prd.md and docs/architecture.md
 
-## Checklist
-
-| Check | Proof |
-| --- | --- |
-| `.env`, `.env.local`, `data/`, and `*.sqlite` are gitignored. `.env.example` values are empty. | `src/lib/security.test.ts` |
-| No secret in `src/` except `test-key` and the live `Bearer ${apiKey}` header. | `src/lib/security.test.ts` |
-| A bad body never calls a provider. | `src/app/api/transcribe/route.test.ts`, `src/app/api/scenes/route.test.ts` |
-| A rate limit refuses before Gemini or Magic Hour. | `src/app/api/transcribe/route.test.ts`, `src/app/api/scenes/route.test.ts` |
-| Page text is not the image prompt and is not stored. | `src/app/api/scenes/route.test.ts`, `src/lib/limits.test.ts` |
-| Logs do not contain page text, prompts, photos, or keys. | `src/lib/security.test.ts` |
-| `X-Forwarded-For` is ignored unless `TRUSTED_PROXY` is `true`. | `src/lib/client-ip.test.ts`, `src/app/api/quota/route.test.ts` |
-| Routes that use SQLite set `runtime = "nodejs"`. | `src/lib/security.test.ts` |
-| Client components do not import the Magic Hour, Gemini, or limits modules. | `src/lib/security.test.ts` |
-| `allowed: false` does not call Magic Hour. | `src/app/api/scenes/route.test.ts` |
-
 ## Trust these
 
-- `npm test` — 107 passed, 1 skipped. The skipped test is the PNG compose check, because this Node process has no `OffscreenCanvas`.
-- Live calls happen only when the matching key is set. Tests use fake fetch and the literal `test-key`.
+- `resolveGeminiKey`: a usable `X-Picta-Gemini-Key` wins; otherwise `GEMINI_API_KEY`. `resolveMagicHourKey` reads only `X-Picta-Magic-Hour-Key`.
+- `sceneGemini`: no usable Gemini key means mode `direct`. The scene prompt is the page text, trimmed, at most 1,500 characters.
+- A 401, 403, or Gemini `API_KEY_` 400 throws `RejectedApiKeyError`. Those routes return 401 `{ "error": "rejected_api_key" }`.
+- Gemini model id is `gemini-3.8-flash` with `thinkingLevel` `low`.
+- `npm test` — 144 passed, 1 skipped. The skipped test is the PNG compose check, because this Node process has no `OffscreenCanvas`.
+- Live calls happen only when the matching key is set. Tests use fake fetch and the literals `test-key` and `env-key`.
 
 ## Do not redo
 
-The reading screen, the quota, transcription, the mock scene, and the live client are finished. Do not add a button, a route, or a screen for this pass.
+The reading screen, the quota, transcription, scenes, and the key dialog are finished. Do not add a button, a route, or a screen.
